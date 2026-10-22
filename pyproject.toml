@@ -1,0 +1,6 @@
+[tool.mypy]
+python_version = "3.11"
+# Check the YAML/schema input boundary and the standalone regex compiler.
+files = ["src/guiderails/rules.py", "src/guiderails/_compile_worker.py"]
+explicit_package_bases = true
+check_untyped_defs = true

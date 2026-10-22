@@ -1,0 +1,16 @@
+*.pyc
+__pycache__/
+.mypy_cache/
+.venv/
+
+# Local credentials and Guiderails profile data
+.env
+.env.*
+!.env.example
+state.hmac-key
+state.sqlite3
+state.sqlite3-*
+audit/
+
+# Generated artifacts
+/dist/

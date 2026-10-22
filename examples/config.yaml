@@ -1,0 +1,20 @@
+schema_version: 1
+# strict는 세션·규칙별 한도 안에서 위반 호출을 거절한다.
+mode: strict
+effect_policy: pattern
+max_rejections: 3
+logging:
+  # 감사 기록에 본문 발췌를 보관하지 않는다.
+  excerpts: false
+
+# Uncomment this example to customize the guidance sent to the model.
+# guidance_templates:
+#   correction: |-
+#     Call blocked ({rule_id}).
+#     Rule: {description}
+#     How to correct the call: {instruction}
+#     {continuation}
+#   warning: |-
+#     Call allowed because the rejection limit was reached ({rule_id}).
+#     Rule: {description}
+#     How to correct the next call: {instruction}

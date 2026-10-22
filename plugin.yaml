@@ -1,0 +1,15 @@
+manifest_version: 2
+name: guiderails
+version: "0.1.0"
+description: Check tool arguments and file candidates before Hermes executes the call.
+kind: standalone
+python_dependencies:
+  - "regex>=2026.1.15,<2027"
+  - "PyYAML>=6.0.3,<7"
+  - "jsonschema>=4.26.0,<5"
+provides_hooks:
+  - pre_tool_call
+provides_middleware:
+  - llm_request
+provides_tools:
+  - guiderails_patterns

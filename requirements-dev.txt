@@ -1,0 +1,9 @@
+# Runtime requirements from plugin.yaml, for running tests outside Hermes.
+regex>=2026.1.15,<2027
+PyYAML>=6.0.3,<7
+jsonschema>=4.26.0,<5
+
+mypy==1.20.2
+types-jsonschema==4.26.0.20261006
+types-PyYAML==6.0.12.20261122
+types-regex==2026.11.19.20261122

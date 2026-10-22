@@ -1,0 +1,22 @@
+schema_version: 1
+rules:
+  - id: ko.avoid-generic-record
+    revision: 2
+    enabled: true
+    description: "'임시 처리'는 실제 수행할 작업을 설명하지 못합니다."
+    priority: 80
+    scopes: [tool.arguments, artifact.text]
+    matcher:
+      type: regex
+      pattern: '임시\s*처리'
+      flags: []
+      normalization: nfc
+    edit_policy: whole_result
+    announce:
+      instruction: "'검토 결과를 문서에 기록한다'처럼 실제 수행할 작업을 쓰세요."
+    tests:
+      positive:
+        - '임시 처리로 남겨 둔다.'
+        - '임시처리로 남겨 둔다.'
+      negative:
+        - '검토 결과를 문서에 기록한다.'

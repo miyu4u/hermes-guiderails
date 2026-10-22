@@ -1,0 +1,967 @@
+# 검증
+
+이 문서는 [동작 계약](CONTRACT.md)의 테스트 위치와 재현 절차를 설명합니다.
+
+## 검증 층위와 재현
+
+- [CI 워크플로](../.github/workflows/ci.yml)는 push와 pull request에서 `ubuntu-latest`와 Python 3.11을 사용합니다.
+- [개발 의존성](../requirements-dev.txt)을 설치한 뒤 mypy로 규칙 로더와 정규식 컴파일 워커를 확인하고 단위·통합 테스트를 각각 실행합니다.
+- Native E2E는 별도 Hermes checkout을 사용하는 수동 인수 절차입니다.
+
+플러그인 저장소 루트에서 새 Python 3.11 환경으로 CI 범위를 재현합니다.
+
+```sh
+unset PYTHONPATH PYTHONHOME
+python -m pip install -r requirements-dev.txt
+scratch=$(mktemp -d)
+python -m mypy --cache-dir "$scratch/mypy"
+for category in unit integration; do
+  run_dir=$(mktemp -d "$scratch/$category.XXXXXX")
+  TMPDIR="$run_dir" TMP="$run_dir" TEMP="$run_dir" \
+    python tests/run.py --category "$category" || exit $?
+done
+```
+
+Native E2E만 실행하려면 `HERMES_CHECKOUT`을 `caafe5389ae585ef77387a962aee05b1bcf17029`의 깨끗한 Hermes checkout으로 지정하고(테스트 구현 시점의 commit) 해당 Hermes와 플러그인의 의존성이 설치된 Python 3.11 환경을 사용합니다.
+
+```sh
+scratch=$(mktemp -d)
+TMPDIR="$scratch" TMP="$scratch" TEMP="$scratch" PYTHONPATH="$HERMES_CHECKOUT" \
+  python tests/run.py --category e2e --require-native \
+  --native-sha caafe5389ae585ef77387a962aee05b1bcf17029
+```
+
+전체 인수 실행은 `--category e2e`를 빼고 필터 없이 수행합니다.
+
+[러너](../tests/run.py)는 세 임시 경로 변수가 같은 기존 디렉터리를 가리키는지 검사하고 홈과 Hermes 설정·캐시를 그 아래로 격리합니다. 자격증명 접미사가 붙은 환경 변수를 제거하고 Hermes의 지연 설치를 비활성화합니다.
+
+`--require-native`는 지정 SHA의 깨끗한 checkout과 네이티브 케이스 실행을 요구하고 skip을 실패로 처리합니다.
+
+## 테스트 케이스 정리
+
+### Unit test
+
+- [도구 어댑터](../tests/unit/test_adapters.py)
+  - **TC-000 · 겹치는 다중 선택자가 배열 값을 한 번만 검사한다**
+    - **사전조건:** `docs.update`의 배열 경로에 와일드카드와 정확 선택자가 겹치고 매치 상한은 1이다.
+    - **단계 1:** `BA`, `line\nBAD`, `D`를 별도 값으로 전달하고 중첩 호출과 다른 도구명도 검사한다.
+      - **기대 결과:** 매치는 `/changes/1/a~1b~0c`의 5~8, 2행 1열 하나다. 중첩 경로에는 `/tool_uses/0/parameters`가 붙는다. 값들을 이어 붙이지 않으며 일치하지 않는 도구·비문자열·빈 배열·객체 와일드카드는 통과한다. `docs.create`의 선택된 `BAD`는 차단한다.
+    - **자동화 근거:** `test_multi_selector_matches_array_paths_once_without_joining_values`
+  - **TC-001 · 정확 선택자는 객체 키의 별표를 문자로 취급한다**
+    - **사전조건:** 객체의 `*`, `a*` 키에 각각 `BAD`가 있다.
+    - **단계 1:** 배열 와일드카드, 정확 선택자와 부분 별표 선택자를 각각 검사한다.
+      - **기대 결과:** 배열 와일드카드는 통과하고 정확 선택자는 각각 `/changes/*`, `/changes/a*`를 보고한다.
+    - **자동화 근거:** `test_only_exact_selector_accepts_literal_object_star`
+  - **TC-002 · 효과와 파일 오류는 다중 선택자 매치보다 우선한다**
+    - **사전조건:** `verified` 정책에 문서 갱신과 패치 인자 선택자가 있다.
+    - **단계 1:** `BAD`가 든 미지원 도구와 일치하는 원문이 없는 패치를 검사한다.
+      - **기대 결과:** 각각 `unsupported_tool`, `ambiguous_or_fuzzy_edit`이며 패치 매치는 비어 있다.
+    - **자동화 근거:** `test_multi_selector_does_not_override_verified_effect_or_file_errors`
+  - **TC-003 · 명시한 인자 규칙은 파일 후보가 아닌 해당 필드를 검사한다**
+    - **사전조건:** 파일의 두 줄에 `BAD`가 있고 한 줄을 `good`으로 교체한다.
+    - **단계 1:** `old_string`과 `new_string`을 각각 선택해 패치와 새 금지문을 검사한다.
+      - **기대 결과:** 원문 선택은 차단하고 새 문자열 선택은 통과한다. 후보에는 다른 `BAD`가 남는다. 선택 필드의 금지문은 오프셋 0으로 보고하고 다른 도구명에는 규칙을 적용하지 않는다.
+    - **자동화 근거:** `test_explicit_argument_rule_matches_raw_field_not_file_candidate`
+  - **TC-004 · 중첩 호출에서 자식 도구명과 이스케이프된 경로를 사용한다**
+    - **사전조건:** `docs.update`의 첫 배열 요소 `a/b~c`를 선택한다.
+    - **단계 1:** 두 번째 요소에만 금지문을 넣은 호출과 첫 요소에 넣은 중첩 호출을 검사한다.
+      - **기대 결과:** 첫 호출과 이름이 다른 직접 호출은 통과하고 중첩 매치는 `/calls/0/arguments/changes/0/a~1b~0c`다.
+    - **자동화 근거:** `test_argument_selector_in_nested_call_uses_child_name_and_escaped_pointer`
+  - **TC-005 · 파일 경로를 로컬 문맥에서 해석하고 불가능한 문맥을 거절한다**
+    - **사전조건:** 홈의 파일 내용은 `BA middle D`이고 로컬 base는 없다.
+    - **단계 1:** 절대 경로, `~/doc`, `..` 경로로 가운데를 제거한다.
+      - **기대 결과:** 모두 같은 대상과 후보 `BAD`를 보고하며 차단한다.
+    - **단계 2:** 상대 경로, 다른 사용자 홈, 원격 백엔드와 홈이 없거나 조회할 수 없는 문맥을 검사한다.
+      - **기대 결과:** 각각 `path_context_unavailable`, `path_context_unavailable`, `unsupported_file_backend`, `file_context_unavailable`, `file_context_unavailable`이며 로컬 읽기는 없고 원본은 유지된다.
+    - **자동화 근거:** `test_namespace_absolute_tilde_dotdot_and_denials`
+  - **TC-006 · 후보가 BOM과 CRLF 및 제어 문자 변환을 보존한다**
+    - **사전조건:** 원본은 BOM과 CRLF, 탭을 포함한다.
+    - **단계 1:** 탭 포함 문자열을 교체하고 줄바꿈이 있는 새 내용을 쓰기 후보로 검사한다.
+      - **기대 결과:** 두 후보는 BOM과 CRLF를 유지하고 교체 후보의 이스케이프는 탭이 된다. 원본 바이트는 변하지 않는다.
+    - **자동화 근거:** `test_candidate_preserves_bom_crlf_and_control_replacements`
+  - **TC-007 · 쓰기 형식 탐지 결과가 다르면 거절한다**
+    - **사전조건:** 긴 UTF-8 내용 뒤에 CRLF가 있는 파일이 있다.
+    - **단계 1:** 줄바꿈이 든 새 내용을 쓰기 검사한다.
+      - **기대 결과:** `ambiguous_file_format`을 반환한다.
+    - **자동화 근거:** `test_write_probe_disagreement_rejected`
+  - **TC-008 · 전체 치환 후보의 UTF-8 바이트 상한을 생성 전에 적용한다**
+    - **사전조건:** 후보 상한은 1,024바이트이며 BOM과 CRLF가 있는 파일을 전체 치환한다.
+    - **단계 1:** 접미어 길이를 바꿔 정확히 1,024바이트인 후보와 초과 후보를 검사한다.
+      - **기대 결과:** 경계 후보는 기대 문자열과 같고 통과하며 초과 후보는 `candidate_too_large`다.
+    - **단계 2:** 900개 문자를 각각 900개 문자로 치환한다.
+      - **기대 결과:** `candidate_too_large`이고 측정 피크 증가는 400,000바이트 미만이다.
+    - **자동화 근거:** `test_replace_all_bounds_formatted_utf8_candidate_before_materializing`
+  - **TC-009 · 호스트가 제어 이스케이프를 변환하는 새 인자를 검사한다**
+    - **사전조건:** 원본에 탭이 있고 규칙은 인자의 리터럴 `\t`를 찾는다.
+    - **단계 1:** 새 문자열에 리터럴 `\t`를 넣어 패치를 검사한다.
+      - **기대 결과:** 호출이 차단되고 후보에는 실제 탭이 있으며 매치 경로는 `/new_string`이다.
+    - **자동화 근거:** `test_new_argument_inspected_when_host_converts_control_escape`
+  - **TC-010 · 남은 금지문과 전체 제거 및 모호한 교체를 구분한다**
+    - **사전조건:** 파일에 `BAD`가 두 번 있다.
+    - **단계 1:** 하나만 교체하고 전체 교체와 단일 정확 교체를 각각 검사한다.
+      - **기대 결과:** 하나만 교체하면 매치 하나가 남고 전체 교체는 `good first\ngood second`로 통과한다. 단일 교체는 `ambiguous_or_fuzzy_edit`이고 원본은 유지된다.
+    - **자동화 근거:** `test_removal_retained_and_fuzzy_edits`
+  - **TC-011 · v4a 추가·수정·삭제와 미지원 이동을 구분한다**
+    - **사전조건:** 기존 파일에 BOM과 CRLF가 있다.
+    - **단계 1:** v4a 수정, 추가, 삭제와 이동을 각각 검사한다.
+      - **기대 결과:** 수정 후보는 BOM·CRLF를 유지하고 추가 후보는 `good\n`, 삭제 후보는 `None`이다. 이동은 `unsupported_patch_header`이며 새 파일은 생성되지 않는다.
+    - **자동화 근거:** `test_v4a_add_update_delete_and_unsupported_operations`
+  - **TC-012 · 잘못된 파일 내용과 비정규 파일을 거절한다**
+    - **사전조건:** 쓰기 대상의 크기 제한을 요청 바이트 길이에 맞춘다.
+    - **단계 1:** 대상에 잘못된 UTF-8, 상한 초과 내용, FIFO, 끊어진 심볼릭 링크를 차례로 둔다.
+      - **기대 결과:** 각각 `tool_read_failed`, `candidate_too_large`, `nonregular_file`, `nonregular_file`을 반환한다.
+    - **자동화 근거:** `test_nonregular_oversized_and_invalid_utf8_are_denied`
+  - **TC-013 · 열기 직전 교체된 심볼릭 링크를 따라가지 않는다**
+    - **사전조건:** 대상과 `BAD`가 든 별도 파일이 있다.
+    - **단계 1:** 파일 열기 직전 대상을 별도 파일로 향하는 링크로 교체한다.
+      - **기대 결과:** `nonregular_file`을 반환하고 별도 파일은 `BAD`로 남는다.
+    - **자동화 근거:** `test_final_symlink_swap_during_open_is_not_followed`
+  - **TC-014 · 원본 또는 요청이 바뀌면 기존 결과의 재검증을 거절한다**
+    - **사전조건:** `old`를 `good`으로 바꾸는 패치를 검사했다.
+    - **단계 1:** 동일 요청을 재검증한 뒤 새 문자열과 원본 파일을 각각 변경한다.
+      - **기대 결과:** 동일 요청은 참이고 변경된 요청과 원본은 각각 거짓이다.
+    - **자동화 근거:** `test_revalidation_rejects_changed_source_and_payload`
+  - **TC-015 · 문서 효과와 신뢰된 revision을 정책에 따라 구분한다**
+    - **사전조건:** `pattern`과 `verified` 정책에 검증된 문서 도구와 미검증 문서 도구를 등록한다.
+    - **단계 1:** 미등록 도구, 금지문을 담은 검증된 문서, 미검증 도구와 코드 실행을 검사한다.
+      - **기대 결과:** 미등록 도구는 `pattern`에서만 통과하고 검증된 문서는 매치 하나로 차단된다. 미검증 revision과 코드 실행은 `verified`에서 각각 `unverified_external_revision`, `opaque_effect`다.
+    - **자동화 근거:** `test_document_scope_and_trusted_revision`
+  - **TC-016 · 정확한 내장 읽기와 중첩 그룹 오류를 구분한다**
+    - **사전조건:** `verified` 정책에 외부 읽기 도구가 등록돼 있다.
+    - **단계 1:** `BAD`가 든 내장 읽기, 외부 읽기, 유사 이름 도구와 중첩 그룹을 검사한다.
+      - **기대 결과:** 내장 읽기는 통과하고 외부 읽기는 차단된다. 유사 이름과 미지원 자식은 `unsupported_tool`이며 자식 매치 경로는 `/calls/1/arguments/text`다. 잘못된 중첩 요소는 `invalid_nested_calls`다.
+    - **자동화 근거:** `test_exact_builtin_reads_and_nested_group_failures`
+  - **TC-017 · 병렬 중복 파일과 인자 크기 초과를 거절한다**
+    - **사전조건:** 병렬 그룹의 두 쓰기가 같은 파일을 대상으로 한다.
+    - **단계 1:** 그룹을 검사하고 별도로 64바이트 상한에서 긴 읽기 경로를 검사한다.
+      - **기대 결과:** 각각 `parallel_file_conflict`, `candidate_too_large`를 반환한다.
+    - **자동화 근거:** `test_nested_duplicate_file_and_limits`
+
+- [Announcer](../tests/unit/test_announcer.py)
+  - **TC-018 · 알림은 불변이며 첫 지원 채널에만 전달한다**
+    - **사전조건:** 채널 순서는 미지원, 지원, 지원이다.
+    - **단계 1:** 알림 필드 변경을 시도한 뒤 알림을 제출한다.
+      - **기대 결과:** 변경은 `FrozenInstanceError`이고 두 번째 채널만 알림을 한 번 받는다.
+    - **자동화 근거:** `test_frozen_and_first_supported`
+  - **TC-019 · 전달 결과가 불확실해도 다음 채널로 재전송하지 않는다**
+    - **사전조건:** 첫 지원 채널이 전달 중 예외를 낸다.
+    - **단계 1:** 알림을 제출하고 첫 채널의 종료를 기다린다.
+      - **기대 결과:** 다음 채널의 호출 목록은 비어 있다.
+    - **자동화 근거:** `test_uncertain_delivery_never_fails_over`
+  - **TC-020 · 워커의 활성 확인과 전달은 제출 시점 문맥을 사용한다**
+    - **사전조건:** ContextVar 값을 `submitted`로 설정한다.
+    - **단계 1:** 알림을 제출한 직후 호출자 문맥을 `changed`로 바꾼다.
+      - **기대 결과:** 활성 확인과 전달 모두 `submitted`를 관찰한다.
+    - **자동화 근거:** `test_context_and_active_guard_are_isolated`
+  - **TC-021 · 진행 중 중복을 합치고 전달 실패 후 키를 해제한다**
+    - **사전조건:** 첫 전달이 같은 coalesce 키를 점유한 채 대기한다.
+    - **단계 1:** 같은 키로 다시 제출한다.
+      - **기대 결과:** 채널 호출은 한 번이다.
+    - **단계 2:** 첫 전달을 실패시키고 완료 콜백이 키를 해제한 뒤 다시 제출한다.
+      - **기대 결과:** 두 번째 전달이 실행되고 총 호출은 두 번이다.
+    - **자동화 근거:** `test_coalescing_releases_after_failure`
+
+- [설정](../tests/unit/test_config.py)
+  - **TC-022 · 거절 한도는 음이 아닌 정수만 받는다**
+    - **사전조건:** schema version은 1이다.
+    - **단계 1:** 한도를 생략하거나 0, 1, 3 및 음수·불리언·실수·문자열·null로 설정한다.
+      - **기대 결과:** 기본값은 3이고 지정 정수는 그대로 적용된다. 나머지는 `PatternError`다.
+    - **자동화 근거:** `test_max_rejections_requires_a_nonnegative_integer`
+  - **TC-023 · 기본 설정과 명시한 모드가 반영된다**
+    - **사전조건:** schema version은 1이다.
+    - **단계 1:** 기본 설정과 `observe`·`verified` 설정을 읽는다.
+      - **기대 결과:** 기본 모드는 `strict`·`pattern`, 정규식 제한은 20ms, 발췌 보관은 1일이다. 명시한 모드와 정책은 그대로 반영된다.
+    - **자동화 근거:** `test_defaults_and_explicit_settings`
+  - **TC-024 · 잘못되거나 범위를 벗어난 설정을 거절한다**
+    - **사전조건:** 잘못된 schema·키·모드, outbox 0·1, 매치 상한 10001, 정규식 제한 0·NaN, 불리언 재시도, semantic 활성화, 중복 모드 및 지나치게 긴 입력을 준비한다.
+    - **단계 1:** 각 설정을 읽는다.
+      - **기대 결과:** 각각 `PatternError`가 발생한다.
+    - **자동화 근거:** `test_invalid_and_unbounded_configuration_is_rejected`
+  - **TC-025 · outbox 최소 용량을 설정에 남긴다**
+    - **사전조건:** schema version 1에서 `max_outbox`를 2로 설정한다.
+    - **단계 1:** 설정을 읽어 딕셔너리로 출력한다.
+      - **기대 결과:** 출력의 `logging.max_outbox`는 2다.
+    - **자동화 근거:** `test_minimum_outbox_capacity_is_accepted`
+  - **TC-026 · 반환한 설정 딕셔너리는 런타임 설정과 분리된다**
+    - **사전조건:** 기본 설정을 읽는다.
+    - **단계 1:** 반환 딕셔너리의 `limits.max_hits`를 1로 바꾼다.
+      - **기대 결과:** 런타임의 매치 상한은 10,000으로 유지된다.
+    - **자동화 근거:** `test_returned_configuration_is_detached`
+
+- [모델 요청 재구성](../tests/unit/test_continuation.py)
+  - **TC-027 · 교정 안내는 같은 세션의 다음 요청과 재시도에만 붙는다**
+    - **사전조건:** 세션 `s`에 중복 안내와 특수 문자가 든 안내를 원래 요청 `first`에서 등록한다.
+    - **단계 1:** 다른 세션, 원래 요청과 보조 요청을 재구성한다.
+      - **기대 결과:** 모두 변경 결과가 없다.
+    - **단계 2:** 같은 세션의 다음 요청과 그 재시도를 재구성하고 이미 처리한 이벤트를 다시 등록한다.
+      - **기대 결과:** 기존 developer 내용 뒤에 중복을 제거하고 `<`, `>`, `&`를 이스케이프한 안내가 붙는다. 재시도 결과는 같고 이후 요청에는 안내가 없다.
+    - **자동화 근거:** `test_next_request_is_session_scoped_and_retries_keep_the_notice`
+  - **TC-028 · 재사용된 호출 ID에서도 표식이 붙은 결과의 호출만 제거한다**
+    - **사전조건:** 같은 호출 ID가 앞선 정상 쌍과 뒤의 제거 대상 쌍에 사용되고 다른 정상 호출도 있다.
+    - **단계 1:** chat completions 메시지를 재구성한다.
+      - **기대 결과:** 뒤의 제거 대상 호출과 결과만 빠지고 앞선 쌍, 다른 호출·결과 및 원본 요청은 유지된다.
+    - **자동화 근거:** `test_removed_result_is_paired_with_its_own_call_when_id_reappears`
+  - **TC-029 · 블록 형식에서 제거 후 빈 메시지를 지우고 다른 내용을 보존한다**
+    - **사전조건:** Anthropic과 Bedrock 형식에 제거 대상 호출·결과, 다른 텍스트와 대기 중 안내가 있다.
+    - **단계 1:** 두 형식의 다음 요청을 각각 재구성한다.
+      - **기대 결과:** 호출·결과와 비어버린 assistant 메시지는 제거되고 다른 사용자 텍스트는 남는다. 각 형식의 system 블록에 안내가 추가된다.
+    - **자동화 근거:** `test_block_formats_keep_other_results_and_strip_empty_messages`
+
+- [규칙 엔진](../tests/unit/test_engine.py)
+  - **TC-030 · 도구 인자 선택자의 범위와 경로를 검증한다**
+    - **사전조건:** 기본 규칙과 `patch` 도구의 `/new_string` 선택자를 준비합니다.
+    - **단계 1:** `tool.arguments` 외 범위, 빈 도구명, 누락된 경로, `/` 없는 경로, 잘못된 `~2` 이스케이프를 각각 로드합니다.
+      - **기대 결과:** 각 로드에서 `PatternError`가 발생합니다.
+    - **자동화 근거:** `test_argument_selectors_require_exact_scope_and_valid_pointer`
+  - **TC-031 · 다중 선택자의 잘못된 구성을 거절한다**
+    - **사전조건:** `docs.update`의 `/changes/*/content` 선택자를 준비합니다.
+    - **단계 1:** 잘못된 범위, 빈 배열, 배열 대신 객체, 중복, 단일·다중 혼용, 잘못된 경로, 추가 필드를 각각 로드합니다.
+      - **기대 결과:** 각 구성에서 `invalid_pattern_schema`가 발생합니다.
+    - **자동화 근거:** `test_multi_selector_schema_rejects_empty_duplicate_and_mixed_forms`
+  - **TC-032 · 검사한 스냅샷의 보관 설정과 지침을 반환한다**
+    - **사전조건:** 기본 규칙의 스냅샷을 보관하고 `keep: false`, 지침 `new`인 revision 2를 로드합니다.
+    - **단계 1:** `first`를 참과 거짓으로 바꿔 이전 스냅샷과 현재 정책으로 `금지`를 검사합니다.
+      - **기대 결과:** 이전 결과는 `(true, 수정하세요.)`, 현재 결과는 `(false, new)`입니다. 명시적 `keep: true`도 참입니다.
+    - **단계 2:** 문자열 `false`, 정수 0, null을 `keep`으로 각각 reload합니다.
+      - **기대 결과:** 각각 `PatternError`가 발생하고 현재 정책의 `keep`은 거짓으로 유지됩니다.
+    - **자동화 근거:** `test_keep_defaults_and_is_attributed_to_the_inspected_snapshot`
+  - **TC-033 · Unicode 정규화 후 원본 위치와 필드 경로를 반환한다**
+    - **사전조건:** 대소문자 무시 NFC 리터럴 `STRASSE`와 NFC 정규식 `^가.+끝$`을 각각 준비합니다.
+    - **단계 1:** `앞\nStraße!`를 `content` 필드로 검사하고 분해된 한글 `가\n끝`을 정규식으로 검사합니다.
+      - **기대 결과:** 첫 매치의 시작·끝·행·열·경로는 `(2, 8, 2, 1, content)`, 두 번째의 원본 범위는 `(0, 4)`입니다.
+    - **자동화 근거:** `test_original_unicode_positions_and_field_path`
+  - **TC-034 · 주변 정규화가 원본 매치 범위를 바꾸지 않는다**
+    - **사전조건:** 이모지 결합 문자, 분해 악센트, 대소문자 접기, 결합 문자 재정렬 사례 여섯 개를 준비합니다.
+    - **단계 1:** 각 리터럴 규칙으로 해당 입력을 검사합니다.
+      - **기대 결과:** 원본 범위는 사례 순서대로 `(0, 1)`, `(2, 3)`, `(2, 4)`, `(2, 3)`, `(0, 3)`, `(1, 2)`입니다.
+    - **자동화 근거:** `test_unicode_original_spans_remain_precise_when_other_text_normalizes`
+  - **TC-035 · 생성한 접미어와 관계없이 대상 문자의 원본 위치를 계산한다**
+    - **사전조건:** 시드 `20261124`, 다섯 접두어와 일곱 Unicode 접미어로 300개 입력을 생성합니다.
+    - **단계 1:** 각 입력에서 첫 `👩`를 검사합니다.
+      - **기대 결과:** 시작·끝은 접두어 길이와 그 다음 위치이고 행·열은 접두어의 줄바꿈을 기준으로 계산한 값입니다.
+    - **자동화 근거:** `test_generated_unicode_suffix_does_not_change_original_positions`
+  - **TC-036 · 우선순위와 범위에 따라 중복 매치를 정리한다**
+    - **사전조건:** 우선순위가 다른 두 전체 매치 규칙, 부분 매치 규칙, 비활성 규칙을 로드합니다.
+    - **단계 1:** `금지`를 `artifact.text`와 `tool.result`에서 검사하고 규칙 목록을 조회합니다.
+      - **기대 결과:** 전자는 `z.high` `(0, 2)`와 `b.second` `(1, 2)`, 후자는 빈 결과입니다. 규칙 목록 순서는 `x.disabled`, `z.high`, `a.first`, `b.second`입니다.
+    - **자동화 근거:** `test_order_scopes_disabled_and_duplicate_spans`
+  - **TC-037 · 잘못된 YAML과 규칙 예제를 거절한다**
+    - **사전조건:** 추가 필드, 잘못된 revision, 중복 ID, 불일치 예제, 중복 YAML 키, 순환 참조, 지원하지 않는 YAML 태그, 빈 매치와 잘못된 정규식을 준비합니다.
+    - **단계 1:** 각 문서를 로드합니다.
+      - **기대 결과:** 활성·비활성 규칙의 잘못된 예제를 포함해 각각 `PatternError`가 발생합니다.
+    - **자동화 근거:** `test_invalid_schema_corpus_and_yaml`
+  - **TC-038 · 실패한 reload에서 기존 스냅샷과 검사 결과를 유지한다**
+    - **사전조건:** 기본 규칙의 스냅샷, digest와 `금지` 검사 결과를 저장합니다.
+    - **단계 1:** 잘못된 문서, revision을 올리지 않은 변경, 잘못된 예제를 각각 reload합니다.
+      - **기대 결과:** 각각 `PatternError`가 발생하며 스냅샷 객체, digest와 검사 결과가 유지됩니다.
+    - **단계 2:** 변경 규칙을 revision 2로 올려 reload하고 이전 스냅샷으로 검사합니다.
+      - **기대 결과:** 현재 digest는 바뀌고 이전 스냅샷의 결과는 기존과 같습니다.
+    - **자동화 근거:** `test_failed_reload_preserves_snapshot_digest_and_inspection`
+  - **TC-039 · 규칙 입력 순서와 무관하게 digest를 계산한다**
+    - **사전조건:** 서로 다른 우선순위의 규칙 두 개를 준비합니다.
+    - **단계 1:** 두 규칙을 정순과 역순으로 각각 로드합니다.
+      - **기대 결과:** 두 엔진의 digest가 같습니다.
+    - **자동화 근거:** `test_canonical_digest_ignores_rule_input_order`
+  - **TC-040 · 고정한 스냅샷과 reload된 정책을 분리한다**
+    - **사전조건:** `금지` 규칙의 스냅샷을 저장하고 `새규칙`을 찾는 revision 2로 reload합니다.
+    - **단계 1:** `금지 새규칙`을 현재 정책과 이전 스냅샷으로 각각 검사합니다.
+      - **기대 결과:** 현재 정책은 `(3, 6)`, 이전 스냅샷은 `(0, 2)`를 반환합니다.
+    - **자동화 근거:** `test_reload_keeps_pinned_snapshot_policy_isolated`
+  - **TC-041 · 후보 크기를 UTF-8 바이트로 제한한다**
+    - **사전조건:** 후보 상한을 6바이트로 설정합니다.
+    - **단계 1:** `금지`와 `금지a`를 각각 검사합니다.
+      - **기대 결과:** 6바이트 입력은 매치 하나를 반환하고 초과 입력은 `InspectionError`를 발생시킵니다.
+    - **자동화 근거:** `test_candidate_limit_counts_utf8_bytes_at_boundary`
+  - **TC-042 · 규칙과 검사 상한 및 컴파일 시간 초과를 거절한다**
+    - **사전조건:** 패턴 길이 상한 1과 후보 상한 20바이트·매치 상한 2를 각각 설정합니다.
+    - **단계 1:** 기본 규칙을 작은 패턴 상한으로 로드하고 21바이트 입력과 `금지` 세 번을 검사합니다.
+      - **기대 결과:** 로드는 `PatternError`, 두 검사는 각각 `InspectionError`를 발생시킵니다.
+    - **단계 2:** 컴파일 프로세스에 시간 초과를 주입해 정규식 규칙을 로드합니다.
+      - **기대 결과:** `regex_compile_timeout`을 포함한 `PatternError`가 발생합니다.
+    - **자동화 근거:** `test_limits_and_compile_timeout_fail_closed`
+  - **TC-043 · 빈 매치와 미지원 정규식 구문을 reload 전에 거절한다**
+    - **사전조건:** 기본 규칙의 스냅샷을 저장합니다.
+    - **단계 1:** lookaround, 빈 매치 대안, `\K`, 역참조, fuzzy 구문을 포함한 정규식 여섯 개를 각각 reload합니다.
+      - **기대 결과:** 빈 매치 대안은 `empty_matching_regex`, 나머지는 `unsupported_regex_construct`이며 각 실패 후 기존 스냅샷과 `금지` 감지가 유지됩니다.
+    - **자동화 근거:** `test_regex_validation_rejects_contextual_empty_matches_before_reload`
+  - **TC-044 · 부모 프로세스의 재컴파일 없이 워커가 준비한 패턴을 사용한다**
+    - **사전조건:** 정규식 두 개와 리터럴 하나를 준비하고 부모의 공개·내부 컴파일 함수를 실패하도록 대체합니다.
+    - **단계 1:** 규칙을 로드하고 `12`, `AB`, `금지`를 검사합니다.
+      - **기대 결과:** 각각 `a.second` 범위 `(0, 2)`, `z.first`, `m.literal`을 반환합니다.
+    - **자동화 근거:** `test_worker_compiled_patterns_are_used_without_parent_recompilation`
+  - **TC-045 · 실제 컴파일 워커 시간 초과 후 기존 정책을 유지한다**
+    - **사전조건:** 컴파일 시간 제한을 `1e-9`초로 설정하고 리터럴 규칙의 스냅샷을 저장합니다.
+    - **단계 1:** 정규식 revision 2를 reload합니다.
+      - **기대 결과:** `regex_compile_timeout`이 발생하고 스냅샷 객체와 기존 `금지` 매치 하나가 유지됩니다.
+    - **자동화 근거:** `test_real_worker_timeout_rejects_candidate_without_changing_snapshot`
+  - **TC-046 · 편집 전부터 있던 매치와 새 매치를 구분한다**
+    - **사전조건:** `introduced` 편집 정책의 `금지` 규칙을 로드합니다.
+    - **단계 1:** `금지 기존`에서 `앞\n금지 기존\n금지`로 바뀐 내용을 검사합니다.
+      - **기대 결과:** 시작 위치와 기존 여부는 각각 `(2, true)`, `(8, false)`입니다.
+    - **자동화 근거:** `test_edit_marks_old_and_new_matches`
+
+- [엔진 부하 검사](../tests/unit/test_engine_load.py)
+  - **TC-047 · 대량 입력을 제한한 뒤 후속 검사를 수행한다**
+    - **사전조건:** 15초 watchdog이 있는 별도 프로세스에서 기본 규칙을 로드합니다.
+    - **단계 1:** UTF-8 24MiB의 한글을 검사하고 정확히 바이트 상한인 입력 끝에 `금지`를 넣어 검사합니다.
+      - **기대 결과:** 대량 입력은 `candidate_too_large`입니다. 상한 입력은 마지막 두 문자를 감지하거나 `inspection_deadline` 또는 `inspection_limit`을 반환합니다.
+    - **단계 2:** 소형 `금지` 입력을 다시 검사합니다.
+      - **기대 결과:** `demo.rule`을 감지하고 별도 프로세스는 시간 제한 내 성공 종료합니다.
+    - **자동화 근거:** `test_super_bulk_text_is_bounded_and_next_inspection_completes`
+  - **TC-048 · 복잡한 정규식의 컴파일과 검색 시간을 제한한다**
+    - **사전조건:** 400개 대안과 네 자리 숫자로 구성한 정규식을 15초 watchdog이 있는 별도 프로세스에서 준비합니다.
+    - **단계 1:** 정상 제한으로 컴파일해 `item399:1234`와 `unrelated`를 검사합니다.
+      - **기대 결과:** 전자는 `(0, 12)`로 매치되고 후자는 빈 결과입니다.
+    - **단계 2:** 컴파일 제한을 `1e-9`초로 줄이고, 성공적으로 컴파일한 스냅샷의 검색 제한을 `1e-6`ms로 줄여 긴 비매치 입력을 검사합니다.
+      - **기대 결과:** 각각 `regex_compile_timeout`, `regex_timeout`이 발생하고 별도 프로세스는 시간 제한 내 성공 종료합니다.
+    - **자동화 근거:** `test_complex_regex_compile_and_search_are_bounded`
+  - **TC-049 · 첫 위반을 찾으면 느린 규칙을 취소하고 제출을 제한한다**
+    - **사전조건:** 느린 규칙과 빠른 규칙, 나머지 규칙 12개를 준비하고 워커 실행과 취소를 추적합니다.
+    - **단계 1:** 느린 규칙이 실행 중일 때 빠른 규칙이 `금지`를 찾도록 `first: true`로 검사합니다.
+      - **기대 결과:** `demo.fast`만 반환하고 느린 규칙이 취소를 관찰합니다. 두 규칙은 서로 다른 워커에서 실행되며 메인 스레드는 사용되지 않고 추적된 규칙은 최대 네 개입니다.
+    - **자동화 근거:** `test_first_completed_violation_stops_slower_rules_and_leaves_no_match_work_queued`
+
+- [파일 읽기](../tests/unit/test_fileio.py)
+  - **TC-050 · 파일 크기가 상한 이하면 내용을 읽고 잘못된 상한은 거절한다**
+    - **사전조건:** 임시 파일과 읽기 상한을 준비합니다.
+    - **단계 1:** 빈 파일을 상한 0으로, `abc`를 상한 3과 2로 읽고 상한 `-1`, `True`, `1.5`도 전달합니다.
+      - **기대 결과:** 빈 바이트와 `abc`를 반환합니다. 상한 2에는 `FileTooLargeError`, 잘못된 상한에는 `ValueError`가 발생합니다.
+    - **자동화 근거:** `test_limits_include_empty_and_exact_boundary`
+  - **TC-051 · UTF-8 텍스트의 상한을 바이트로 적용한다**
+    - **사전조건:** 파일에 UTF-8 한 글자 `한`을 씁니다.
+    - **단계 1:** 상한 3과 2로 읽은 뒤 파일을 `0xff`로 바꾸고 상한 1로 읽습니다.
+      - **기대 결과:** 상한 3에서는 `한`을 반환하고, 상한 2에서는 `FileTooLargeError`, 잘못된 UTF-8에는 `UnicodeDecodeError`가 발생합니다.
+    - **자동화 근거:** `test_utf8_validation_is_byte_bounded`
+  - **TC-052 · 키는 정확히 32바이트일 때만 읽는다**
+    - **사전조건:** `0xff`로 채운 길이 0, 31, 32, 33바이트 파일을 차례로 준비합니다.
+    - **단계 1:** 각 파일을 키로 읽습니다.
+      - **기대 결과:** 32바이트는 그대로 반환하고 나머지는 `InvalidKeyLengthError`가 발생합니다.
+    - **자동화 근거:** `test_key_exactly_32_arbitrary_bytes`
+  - **TC-053 · 없는 경로와 일반 파일이 아닌 경로를 구분한다**
+    - **사전조건:** 없는 경로와 디렉터리, FIFO, 없는 대상을 가리키는 심볼릭 링크를 차례로 준비합니다.
+    - **단계 1:** 각 경로를 상한 10으로 읽습니다.
+      - **기대 결과:** 없는 경로에는 `FileNotFoundError`, 나머지에는 `NonRegularFileError`가 발생합니다.
+    - **자동화 근거:** `test_nonregular_and_missing_paths`
+  - **TC-054 · 열기 직전에 FIFO로 바뀐 파일은 읽지 않는다**
+    - **사전조건:** 일반 파일을 만들고 열기 호출 시 FIFO로 교체합니다.
+    - **단계 1:** 상한 100으로 읽습니다.
+      - **기대 결과:** 열기 플래그에 `O_NONBLOCK`이 있고 `NonRegularFileError`가 발생하며 `os.read`는 호출되지 않습니다.
+    - **자동화 근거:** `test_fifo_replacement_is_opened_nonblocking_and_not_read`
+  - **TC-055 · 열기 직전에 바뀐 심볼릭 링크를 따라가지 않는다**
+    - **사전조건:** 일반 파일과 대상 파일을 만들고 열기 호출 시 원본을 대상의 심볼릭 링크로 교체합니다.
+    - **단계 1:** 상한 100으로 읽습니다.
+      - **기대 결과:** 열기 플래그에 `O_NOFOLLOW`가 있고 `NonRegularFileError`가 발생하며 `os.read`는 호출되지 않습니다.
+    - **자동화 근거:** `test_symlink_replacement_is_not_followed`
+  - **TC-056 · 교체 후 열린 파일의 크기를 읽기 전에 확인한다**
+    - **사전조건:** 1바이트 파일을 열기 직전에 4바이트 파일로 교체합니다.
+    - **단계 1:** 상한 3으로 읽습니다.
+      - **기대 결과:** `FileTooLargeError`가 발생하고 `os.read`는 호출되지 않습니다.
+    - **자동화 근거:** `test_opened_file_size_is_checked_after_replacement`
+  - **TC-057 · 읽는 중 파일이 커져도 읽기 요청을 제한한다**
+    - **사전조건:** 2바이트 파일의 첫 읽기 때 4바이트를 추가하고 각 읽기는 최대 1바이트만 반환하도록 합니다.
+    - **단계 1:** 상한 3으로 읽습니다.
+      - **기대 결과:** `FileTooLargeError`가 발생하고 읽기 요청 크기는 `[4, 3, 2, 1]`입니다.
+    - **자동화 근거:** `test_growth_and_short_reads_remain_bounded`
+  - **TC-058 · 운영체제의 열기 권한 오류를 전파한다**
+    - **사전조건:** 3바이트 파일을 만들고 열기에서 `PermissionError`가 발생하도록 합니다.
+    - **단계 1:** 상한 3으로 읽습니다.
+      - **기대 결과:** 호출자에게 `PermissionError`가 전파됩니다.
+    - **자동화 근거:** `test_os_errors_propagate`
+
+- [Hermes 파일 문맥](../tests/unit/test_host.py)
+  - **TC-059 · 공개 설정의 작업 경로를 로컬 기준 경로로 허용하지 않는다**
+    - **사전조건:** 홈은 `/fixture/home`, 설정의 작업 경로는 `/private/task`입니다.
+    - **단계 1:** 로컬 백엔드와 로컬 환경에서 문맥을 조회하고 백엔드를 `ssh`, `docker`, `unknown`으로 바꾼 뒤 로컬 백엔드에 환경값 `docker`도 적용합니다.
+      - **기대 결과:** 로컬 문맥은 `local: True`, `base: None`, 지정된 홈을 반환합니다. 원격 백엔드는 `local: False`, `base: None`, `home: None`을 반환하고 `docker` 환경도 로컬이 아닙니다.
+    - **자동화 근거:** `test_public_configuration_does_not_authorize_task_cwd`
+  - **TC-060 · 호스트 설정을 읽을 수 없으면 내부 내용을 노출하지 않는다**
+    - **사전조건:** 설정이 `None`, 빈 목록, 빈 객체, terminal이 `None`인 객체, backend가 `None`인 객체이거나 설정 조회가 상세 메시지가 든 `OSError`를 발생시킵니다.
+    - **단계 1:** 각각 파일 문맥을 조회합니다.
+      - **기대 결과:** 모두 메시지가 정확히 `file_context_unavailable`인 `InspectionError`를 발생시킵니다.
+    - **자동화 근거:** `test_missing_and_failing_host_configuration_is_content_free`
+
+- [테스트 러너](../tests/unit/test_runner.py)
+  - **TC-061 · 케이스 결과와 하위 테스트 결과를 따로 집계한다**
+    - **사전조건:** 성공, 실패, 오류, skip과 여러 하위 테스트 결과를 만드는 케이스 6개를 준비합니다.
+    - **단계 1:** `CaseResult`로 실행합니다.
+      - **기대 결과:** 케이스는 성공 1, 실패 2, 오류 2, skip 1이며 하위 테스트는 실패 6, 오류 1, skip 1입니다. 전체 결과는 성공이 아닙니다.
+    - **자동화 근거:** `test_cases_are_distinct_from_subtest_outcomes`
+  - **TC-062 · 클래스 준비 오류를 실행 케이스로 세지 않는다**
+    - **사전조건:** `setUpClass`에서 오류가 발생하는 테스트 클래스를 준비합니다.
+    - **단계 1:** `CaseResult`로 실행합니다.
+      - **기대 결과:** 실행 케이스는 0, 케이스 결과는 빈 객체, fixture 오류는 1이며 전체 결과는 성공이 아닙니다.
+    - **자동화 근거:** `test_fixture_error_does_not_create_a_case`
+  - **TC-063 · 하위 테스트의 네이티브 분류에 부모를 사용한다**
+    - **사전조건:** 모듈이 `e2e.example`인 테스트 인스턴스를 부모로 가진 객체를 만듭니다.
+    - **단계 1:** 해당 객체를 네이티브 테스트인지 판별합니다.
+      - **기대 결과:** `True`를 반환합니다.
+    - **자동화 근거:** `test_native_subtest_skip_belongs_to_parent`
+  - **TC-064 · 클래스 준비 skip을 케이스나 하위 테스트로 세지 않는다**
+    - **사전조건:** `setUpClass`에서 `SkipTest`를 발생시키는 테스트 클래스를 준비합니다.
+    - **단계 1:** `CaseResult`로 실행합니다.
+      - **기대 결과:** 실행 케이스 0, fixture skip 1, 하위 테스트 skip 0이고 케이스 결과는 비어 있습니다.
+    - **자동화 근거:** `test_fixture_skip_is_not_a_case_or_subtest`
+  - **TC-065 · 추적 및 비추적 변경이 있는 checkout을 구분한다**
+    - **사전조건:** checkout 경로와 40자리 SHA를 지정하고 Git 상태를 빈 값, 비추적 파일, 추적 파일 변경으로 준비합니다.
+    - **단계 1:** 각 checkout 상태를 조회합니다.
+      - **기대 결과:** 빈 상태는 `(SHA, True)`, 두 변경 상태는 `(SHA, False)`입니다. 상태 조회에 `--untracked-files=all`이 포함됩니다.
+    - **자동화 근거:** `test_clean_and_dirty_checkout`
+  - **TC-066 · checkout이 아니거나 Git이 실패하면 유효한 SHA를 반환하지 않는다**
+    - **사전조건:** Git 루트가 요청 경로와 다르거나 Git 명령이 실패하도록 합니다.
+    - **단계 1:** checkout 상태를 조회합니다.
+      - **기대 결과:** 두 경우 모두 `(None, False)`를 반환합니다.
+    - **자동화 근거:** `test_rejects_non_checkout_and_git_failure`
+  - **TC-067 · 네이티브 필수 실행에 올바른 명시적 SHA를 요구한다**
+    - **사전조건:** 네이티브 필수 옵션을 지정하고 SHA를 생략하거나 `abc`를 지정합니다.
+    - **단계 1:** 러너를 호출합니다.
+      - **기대 결과:** 두 경우 모두 종료 코드 2로 종료합니다.
+    - **자동화 근거:** `test_explicit_sha_is_required_and_validated`
+  - **TC-068 · 네이티브 checkout 누락과 변경 및 SHA 불일치를 거절한다**
+    - **사전조건:** 필수 SHA `a` 40자와 함께 checkout 누락, 동일 SHA의 dirty 상태, 다른 SHA의 clean 상태를 준비합니다.
+    - **단계 1:** 각각 네이티브 필수 모드로 러너를 호출합니다.
+      - **기대 결과:** 세 경우 모두 종료 코드 2로 종료합니다.
+    - **자동화 근거:** `test_acceptance_rejects_missing_dirty_or_mismatched_checkout`
+  - **TC-069 · 탐색 실행의 이름 필터와 실행 결과를 보고서에 기록한다**
+    - **사전조건:** 성공하는 예제 테스트 한 개와 필터 `example`, `other*`를 준비합니다.
+    - **단계 1:** 러너를 호출하고 `test-results.json`을 읽습니다.
+      - **기대 결과:** 종료 코드는 0이고 로더 패턴은 `*example*`, `other*`입니다. 보고서에는 원래 필터와 테스트 1, 성공 1, 실패 0이 기록됩니다.
+    - **자동화 근거:** `test_exploratory_selection_and_report`
+  - **TC-070 · 이름 패턴에 맞는 테스트만 선택한다**
+    - **사전조건:** `first`, `second`, `unselected` 테스트와 패턴 `*first*`, `*second`를 준비합니다.
+    - **단계 1:** 로더로 테스트를 선택합니다.
+      - **기대 결과:** `test_first`, `test_second`만 그 순서로 선택됩니다.
+    - **자동화 근거:** `test_selection_patterns_filter_test_names`
+
+### E2E test
+
+- [네이티브 도구 실행](../tests/e2e/test_core_integration.py)
+  - **TC-071 · 스트리밍 답변의 원문을 전달한다**
+    - **사전조건:** `금지`를 감지하는 도구 규칙과 스트림 조각을 수집하는 콜백을 설정합니다.
+    - **단계 1:** 모델 fixture가 `앞 `, `금지`, ` 뒤`를 연달아 보내도록 대화를 실행합니다.
+      - **기대 결과:** 수신 조각을 합친 값과 최종 응답이 모두 `앞 금지 뒤`입니다. 모델 요청은 1회, 감지는 0건이며 스트림은 닫힙니다.
+    - **자동화 근거:** `test_response_stream_is_not_inspected`
+  - **TC-072 · 같은 세션의 거절 한도를 여러 턴에 걸쳐 적용한다**
+    - **사전조건:** 설정 생략, `0`, `1`, `3`을 각각 사용합니다. 적용 한도는 차례로 3, 0, 1, 3이며 각 변형은 새 세션에서 시작합니다.
+    - **단계 1:** 같은 세션에서 대화 기록을 이어가며 `금지 0`부터 `금지 3`까지 각각 다른 턴과 파일로 씁니다.
+      - **기대 결과:** 최초 한도만큼 감사 판정은 `blocked`이며 파일이 생성되지 않습니다. 해당 후속 요청의 도구 결과와 지침에는 패턴 오류와 교정 안내가 포함됩니다.
+      - **기대 결과:** 나머지 판정은 `warned_allowed`이며 각 파일에 요청한 내용이 저장됩니다. 경고는 해당 턴의 첫 모델 요청에 없고 후속 요청에 나타납니다. 전체 핸들러 실행은 `4 - 한도`회, 모델 요청은 8회입니다.
+    - **자동화 근거:** `test_rejection_budget_across_real_turns_and_requests`
+  - **TC-073 · 패치의 검색 문자열은 허용하고 금지 문구 재도입은 차단한다**
+    - **사전조건:** 파일에 `금지`가 있고 규칙은 `patch`의 `/new_string`만 검사합니다.
+    - **단계 1:** `old_string: 금지`, `new_string: 정상`으로 교체합니다.
+      - **기대 결과:** 패치 핸들러가 실행됩니다.
+    - **단계 2:** `old_string: 정상`, `new_string: 금지`로 되돌리는 패치를 요청합니다.
+      - **기대 결과:** 후속 모델 요청에 `guiderails.pattern_detected`가 나타납니다. 감사 위치는 `/new_string` 오프셋 0이며 파일은 `정상`, 전체 핸들러 실행은 1회입니다.
+    - **자동화 근거:** `test_native_patch_argument_rule_allows_removal_and_blocks_reintroduction`
+  - **TC-074 · Notion 생성과 수정이 거절 한도를 공유한다**
+    - **사전조건:** 예제 문체 규칙을 로드하고 한도를 2로 설정합니다. Notion 생성·수정은 호출 인자를 기록하는 fixture로 실행합니다.
+    - **단계 1:** 두 번째 페이지 본문과 두 번째 수정 항목의 대체 문자열에 각각 위반 문구를 넣어 생성과 수정을 요청합니다.
+      - **기대 결과:** 두 요청 모두 `guiderails.pattern_detected`이며 해당 핸들러는 실행되지 않습니다. 감사 경로는 `/pages/1/content`, `/content_updates/1/new_str`입니다.
+    - **단계 2:** 위반 문구를 검색에만 쓰고 정상 문장을 넣는 수정 후, 위반 문구가 들어간 전체 본문 교체를 요청합니다.
+      - **기대 결과:** 수정 핸들러에 두 요청이 순서대로 전달됩니다. 마지막 요청은 `/new_str`에서 `warned_allowed`이고 후속 모델 요청에 경고가 포함됩니다. 전체 모델 요청은 5회이며 같은 세션의 거절 집계는 2입니다.
+    - **자동화 근거:** `test_native_notion_selectors_share_budget_and_preserve_corrective_edit`
+  - **TC-075 · Notion 본문 삽입과 전체 교체에서 새 내용을 검사한다**
+    - **사전조건:** 예제 문체 규칙과 Notion 수정 fixture를 로드합니다. 각 연산은 별도 초기 상태에서 실행합니다.
+    - **단계 1:** `insert_content`의 `content`와 `replace_content`의 `new_str`에 동일한 위반 문구를 넣습니다.
+      - **기대 결과:** 각 변형에서 수정 핸들러는 0회 실행되고 후속 모델 요청에 `guiderails.pattern_detected`가 포함됩니다. `blocked` 감사 1건의 경로는 각각 `/content`, `/new_str`입니다.
+    - **자동화 근거:** `test_native_notion_insertion_and_replacement_are_inspected`
+  - **TC-076 · 같은 배치의 정상 결과를 보존하고 거절 결과만 `keep`으로 제어한다**
+    - **사전조건:** `keep: true`와 `false`를 각각 설정한 세션을 준비합니다. 대상 파일 세 개는 생성 전 상태입니다.
+    - **단계 1:** `금지`, `정상`, `금지`를 각기 다른 파일에 쓰는 호출을 같은 배치에 넣습니다.
+      - **기대 결과:** 핸들러는 `정상` 쓰기로 1회 실행되며 해당 파일만 생성됩니다. 후속 요청의 호출·결과 쌍은 `true`에서 3개, `false`에서 정상 1개입니다.
+      - **기대 결과:** 양쪽 모두 규칙 교정 지침은 한 번이며, 각 차단 감사 ID에 대응하는 사용자 알림이 한 건씩 총 두 건입니다.
+    - **자동화 근거:** `test_keep_controls_real_batched_tool_pairs_only`
+  - **TC-077 · 금지된 파일 쓰기를 차단하고 같은 턴에서 교정본만 저장한다**
+    - **사전조건:** `금지`를 차단하는 규칙을 로드합니다. `new-document.txt`는 아직 없습니다.
+    - **단계 1:** 모델 fixture가 `blocked-write` 호출로 `write_file`에 `금지`를 전달합니다.
+      - **기대 결과:** 두 번째 모델 요청이 시작될 때 대상 파일은 없습니다. 해당 요청에 `blocked-write`와 `guiderails.pattern_detected`가 들어 있습니다.
+    - **단계 2:** 같은 턴의 `repaired-write` 호출에서 동일 경로에 `정상`을 씁니다.
+      - **기대 결과:** 전체 턴에서 쓰기 핸들러가 1회 실행되며 최종 파일은 `정상`의 UTF-8 바이트입니다. 사용자 메시지는 1개, 모델 요청은 3회, 감지 감사와 해당 ID의 차단 알림은 각각 1건입니다.
+    - **자동화 근거:** `test_blocked_write_is_repaired_by_agent_without_creating_forbidden_file`
+  - **TC-078 · 같은 턴에서 별도 파일을 쓰고 읽은 뒤 규칙 위반을 교정한다**
+    - **사전조건:** `document.txt`에는 `금 중간 지`가 있습니다.
+    - **단계 1:** `first.txt`에 `처리 완료`를 씁니다.
+      - **기대 결과:** 첫 파일이 저장됩니다.
+    - **단계 2:** 절대 경로로 대상을 읽고 ` 중간 `을 삭제하는 패치, ` 사이 `로 교체하는 패치를 차례로 요청합니다.
+      - **기대 결과:** 읽기 결과는 `금 중간 지`입니다. 금지 문구를 만드는 삭제는 `guiderails.pattern_detected`이고 교체만 실행돼 `금 사이 지`가 저장됩니다. 쓰기·읽기·편집 핸들러는 각각 1회, 사용자 메시지는 1개, 모델 요청은 5회입니다.
+    - **자동화 근거:** `test_prior_write_read_and_rule_repair_share_one_turn`
+  - **TC-079 · Observe에서 패턴 감지와 구조·저장 오류를 구분한다**
+    - **사전조건:** `mode: observe`이며 `금지` 감지 규칙을 로드합니다.
+    - **단계 1:** `observe.txt`에 `금지`를 씁니다.
+      - **기대 결과:** 쓰기 1회로 `금지`가 저장됩니다. 감지는 1건, 거절 집계는 0입니다.
+    - **단계 2:** 자식 호출 배열 끝에 `None`을 붙여 그룹을 검사합니다.
+      - **기대 결과:** `invalid_nested_calls`를 반환하고 자식 호출은 실행되지 않습니다. 차단 사유에 원문 `금지`가 없습니다.
+    - **단계 3:** 감지 저장에 `OSError`를 주입하고 다른 파일에 `금지`를 쓰도록 요청합니다.
+      - **기대 결과:** 쓰기 1회로 파일에 `금지`가 저장되고 모델은 `완료`로 응답합니다. 내부 오류 본문은 요청과 대화 결과에 없습니다.
+    - **자동화 근거:** `test_observe_allows_native_write_after_detection_or_storage_failure`
+  - **TC-080 · Hermes 공개 진입점에서 플러그인을 찾고 상태를 조회한다**
+    - **사전조건:** 깨끗한 임시 Hermes 프로필에 플러그인을 배치합니다.
+    - **단계 1:** Hermes 로더로 발견한 훅과 모델 도구 정의를 조회합니다.
+      - **기대 결과:** `pre_tool_call` 콜백 1개, `guiderails` 명령과 `guiderails_patterns` 모델 도구를 찾을 수 있습니다.
+    - **단계 2:** 명령 디스패치와 도구 레지스트리를 통해 각각 `status`를 요청합니다.
+      - **기대 결과:** 두 JSON 응답 모두 `ok: true`입니다.
+    - **자동화 근거:** `test_native_discovery_and_registration`
+  - **TC-081 · 감지 발췌를 가리고 만료 시 제거한다**
+    - **사전조건:** 발췌 저장을 활성화하고 시계를 고정합니다. 입력은 `금지`와 fixture 비밀번호를 포함합니다.
+    - **단계 1:** 해당 입력의 쓰기를 검사하고 기본 만료 시각 직전 `report`와 감사 JSONL을 읽습니다.
+      - **기대 결과:** 차단 응답에 `guiderails.pattern_detected`가 있습니다. 만료는 감지 시각에서 86,400초 뒤입니다. `report`의 발췌에는 `금지`가 있고 비밀번호는 가려집니다. JSONL에는 발췌 필드가 없으며 차단 응답과 JSONL에 비밀번호가 없습니다.
+    - **단계 2:** 시계를 정확히 만료 시각에 놓고 다시 조회합니다.
+      - **기대 결과:** 조회 결과에 발췌 필드가 없고 SQLite의 발췌 행은 0개입니다.
+    - **자동화 근거:** `test_native_excerpt_is_redacted_expires_and_stays_out_of_jsonl`
+  - **TC-082 · 크기 한도를 초과한 쓰기는 알림 완료를 기다리지 않는다**
+    - **사전조건:** 후보 한도를 1,024바이트로 설정하고 알림 fixture를 전달 도중 대기시킬 수 있게 구성합니다.
+    - **단계 1:** `금지` 뒤에 `x` 1,024자를 붙여 쓰도록 요청합니다. 알림 워커를 해제하기 전에 대화 결과와 파일을 확인합니다.
+      - **기대 결과:** `Guiderails · BYPASSED · Inspection budget exceeded`가 한 번 제출되고 전달 완료 전에도 대화가 끝납니다. 쓰기 핸들러는 1회, 모델 요청은 2회이며 파일 바이트는 입력과 일치하고 감지는 0건입니다.
+    - **자동화 근거:** `test_native_oversized_write_runs_handler_and_emits_scoped_notice`
+  - **TC-083 · 로컬 경로를 해석하고 확인할 수 없는 파일 환경에서는 검사를 생략한다**
+    - **사전조건:** 로컬 홈의 `target.txt`에 `금지`를 저장합니다.
+    - **단계 1:** `~/target.txt`와 `..`를 포함한 동일 대상의 절대 경로로 `정상` 교정 패치를 각각 훅에 전달합니다.
+      - **기대 결과:** 두 훅 판정 모두 차단 메시지가 없습니다.
+    - **단계 2:** Docker 파일 백엔드로 설정한 상태에서 같은 대상에 `write_file`을 요청합니다.
+      - **기대 결과:** 훅은 호출을 차단하지 않습니다. 작업 디렉터리를 확인할 수 없는 상대 경로 편집에도 동일하게 적용합니다.
+    - **자동화 근거:** `test_native_file_namespace_skips_unavailable_backend_and_resolves_local_targets`
+  - **TC-084 · 중복 파일 쓰기 그룹과 검증되지 않은 외부 효과를 거절한다**
+    - **사전조건:** 그룹의 두 자식이 동일한 미생성 파일을 가리킵니다. 외부 효과 검사는 별도 `verified` 프로필을 사용합니다.
+    - **단계 1:** 같은 경로에 서로 다른 내용을 쓰는 그룹을 검사합니다.
+      - **기대 결과:** 그룹이 차단되고 자식 디스패치는 0회이며 파일은 생성되지 않습니다.
+    - **단계 2:** `verified` 프로필에서 `mcp__unknown__change`에 정상 문구를 전달합니다.
+      - **기대 결과:** 훅에서 차단 메시지를 반환합니다.
+    - **자동화 근거:** `test_native_group_rejects_duplicate_writes_and_verified_unknown_effect`
+  - **TC-085 · 구조 오류가 크기 한도보다 우선한다**
+    - **사전조건:** 후보 한도는 400바이트입니다. 같은 파일을 가리키는 경로 별칭과 쓰기·패치 조합을 준비합니다.
+    - **단계 1:** 중복 대상 그룹, 잘못된 패치 시작 줄, 미지원 이동 헤더, 잘못된 추가 줄을 각각 패딩 없이 그리고 401자 패딩을 붙여 검사합니다.
+      - **기대 결과:** 크기와 무관하게 해당 구조 오류인 `parallel_file_conflict`, `invalid_patch`, `unsupported_patch_header`, `invalid_add_patch`가 반환되며 생략 알림 호출은 0회입니다.
+    - **단계 2:** 문법이 올바른 CRLF 패치에 401자의 추가 줄을 넣어 `valid-call` 세션에서 검사합니다.
+      - **기대 결과:** 훅이 통과하고 `candidate_too_large`와 세션 `valid-call`로 생략 알림을 1회 요청합니다. 훅 호출만 수행했으므로 대상 파일은 없습니다.
+    - **자동화 근거:** `test_native_structural_errors_take_precedence_over_content_size`
+  - **TC-086 · BOM과 CRLF를 적용한 예상 후보가 실제 저장 바이트와 일치한다**
+    - **사전조건:** BOM 유무를 바꾼 CRLF 원본 `기존\r\n끝`과 리터럴 규칙 `금\r\n지`를 준비합니다.
+    - **단계 1:** 쓰기·정확 교체·v4a 각각에서 `금\n지`를 제출합니다.
+      - **기대 결과:** CRLF 후보에서 위반을 감지해 `guiderails.pattern_detected`로 차단하며 원본 바이트는 그대로입니다.
+    - **단계 2:** 같은 조합에서 `교정\n문서`로 검사한 뒤 Hermes 핸들러를 실행합니다.
+      - **기대 결과:** 훅과 핸들러에 오류가 없으며 저장 바이트가 검사 후보의 UTF-8 바이트와 일치합니다.
+    - **자동화 근거:** `test_candidate_bytes_match_actual_file_handlers`
+  - **TC-087 · 4KiB 경계 주변에서도 예상 후보와 저장 바이트가 일치한다**
+    - **사전조건:** 시드 `20261124`로 쓰기·정확 교체·v4a, BOM 유무, LF·CRLF, `기존`의 바이트 오프셋 4,095·4,096·4,097을 조합합니다.
+    - **단계 1:** 각 원본에서 `금지`를 쓰거나 삽입합니다.
+      - **기대 결과:** 원본의 `기존` 오프셋이 지정한 값과 일치하고 요청은 `guiderails.pattern_detected`로 차단되며 원본 파일이 보존됩니다.
+    - **단계 2:** 같은 조합에 시드로 고른 정상 문자열을 제출하고 실제 핸들러를 실행합니다.
+      - **기대 결과:** 후보와 실행 판정 모두 통과하고 저장 파일은 후보와 바이트 단위로 같습니다.
+    - **자동화 근거:** `test_generated_candidates_match_native_bytes_and_preserve_blocked_files`
+  - **TC-088 · 탭 이스케이프와 v4a 파일 끝의 실제 저장 내용을 검사한다**
+    - **사전조건:** 탭이 있는 기존 파일과 별도의 미생성 `added.txt`를 준비합니다. 기존 파일용 리터럴 규칙은 실제 탭을, 추가용 정규식 `금지\Z`는 입력 끝을 검사합니다.
+    - **단계 1:** 정확 교체와 v4a에서 각각 `금\t지`와 `교정\t문서`를 문자 그대로의 이스케이프로 제출합니다.
+      - **기대 결과:** 첫 입력은 탭으로 변환한 후보에서 위반으로 감지돼 원본을 보존합니다. 정상 입력은 핸들러가 저장한 바이트와 예상 후보가 일치합니다.
+    - **단계 2:** v4a로 `added.txt`에 `금지`를 추가하고 이어서 `정상`을 추가합니다.
+      - **기대 결과:** 금지 입력은 파일을 생성하지 않습니다. 정상 입력은 통과하며 파일 바이트는 끝 개행 없이 `정상`입니다.
+    - **자동화 근거:** `test_control_characters_and_v4a_terminal_candidates`
+  - **TC-089 · 파일 형식이 모호한 쓰기를 같은 턴의 정확 교체로 처리한다**
+    - **사전조건:** `long-line.txt`에 `가` 1,400자와 `\r\n끝`을 저장합니다.
+    - **단계 1:** `write_file`로 `교정\n문서`를 쓰도록 요청합니다.
+      - **기대 결과:** 후속 요청에 `ambiguous_file_format`이 있으며 쓰기 핸들러는 실행되지 않습니다.
+    - **단계 2:** 동일한 사용자 턴에서 전체 원본을 `old_string`으로 지정해 정확 패치를 요청합니다.
+      - **기대 결과:** 편집 핸들러만 1회 실행되고 저장 바이트는 `교정\r\n문서`입니다. 사용자 메시지는 1개, 모델 요청은 3회입니다.
+    - **자동화 근거:** `test_ambiguous_write_recovers_with_exact_edit_in_same_turn`
+
+- 수동 Ink E2E 검증
+  - **TC-090 · 실제 Ink에 사용자 알림을 표시하고 모델 입력과 분리한다**
+    - **사전조건:** 실제 Ink와 Gateway를 두 임시 프로필로 실행하고 루프백 모델 fixture로 각 후속 응답을 일시 정지할 수 있게 합니다.
+    - **단계 1:** 첫 프로필에서 금지 쓰기와 교정 쓰기를 순서대로 제출합니다.
+      - **기대 결과:** 교정 전에는 파일이 없고 Ink 대화에는 `BLOCKED` 알림이 한 번 표시됩니다. 교정 후 저장 바이트가 일치하고 루프백 모델 요청 3개에 사용자 알림 문구가 없습니다.
+    - **단계 2:** 두 번째 프로필에서 검사 예산을 넘는 쓰기를 실행합니다.
+      - **기대 결과:** 쓰기가 완료되고 Ink 대화에 `BYPASSED` 알림이 한 번 표시됩니다. 루프백 모델 요청 2개에 사용자 알림 문구가 없습니다.
+
+### Integration
+
+- [호출 게이트](../tests/integration/test_pre_tool_call.py)
+  - **TC-091 · 직접 읽기는 정책 관리자를 열지 않는다**
+    - **사전조건:** 정책 관리자를 생성하면 예외가 나도록 설정하고 프로필 저장소는 비어 있다.
+    - **단계 1:** `read_file`, `search_files`와 1,048,577자 경로의 읽기를 호출한다.
+      - **기대 결과:** 세 호출이 모두 통과하고 프로필 저장소가 생성되지 않는다.
+    - **자동화 근거:** `test_direct_reads_do_not_open_profile_even_with_invalid_policy`
+  - **TC-092 · 잘못된 관리 요청은 프로필을 초기화하지 않는다**
+    - **사전조건:** 프로필 저장소가 없는 상태다.
+    - **단계 1:** 잘못된 목록 인자와 통계 필터를 전달하고 모델 도구로 승인을 요청한다.
+      - **기대 결과:** 각각 `invalid_management_arguments`, `invalid_management_filters`, `human_approval_command_required`를 반환하고 저장소는 생성되지 않는다.
+    - **자동화 근거:** `test_management_validation_does_not_initialize_profile`
+  - **TC-093 · Observe 모드에서 감사 내보내기와 저장 실패 시 호출을 진행한다**
+    - **사전조건:** 규칙과 `observe` 모드를 설정한다.
+    - **단계 1:** 위반 입력 `original`을 검사하고 감지 기록을 조회한다.
+      - **기대 결과:** 호출은 통과하고 `detected` 이벤트가 남으며 이벤트에 원문이 없다.
+    - **단계 2:** 감사 내보내기와 SQLite 저장 각각에 내부 예외를 주입하고 새 호출을 검사한다.
+      - **기대 결과:** 두 호출이 통과한다. 내보내기에 실패한 이벤트는 보고서에 남고 `audit_pending`이 표시된다. 저장에 실패한 호출은 대기 이벤트를 추가하지 않는다.
+    - **자동화 근거:** `test_observe_allows_calls_when_audit_export_or_storage_fails`
+  - **TC-094 · 중첩 JSON의 위반 값은 일반 도구에서만 감지한다**
+    - **사전조건:** 규칙을 설정하고 시드 `20261124`로 중첩 문자열 12개를 만든다.
+    - **단계 1:** 각 정상 값과 `original`을 덧붙인 값을 일반 도구와 직접 읽기에 전달한다.
+      - **기대 결과:** 정상 값과 직접 읽기는 통과하고 위반 일반 도구는 `guiderails.pattern_detected`로 차단된다.
+    - **자동화 근거:** `test_seeded_nested_json_and_matching_values`
+  - **TC-095 · 중첩 깊이와 UTF-8 크기 경계를 구분한다**
+    - **사전조건:** 규칙과 기본 바이트 상한 1,048,576을 사용한다.
+    - **단계 1:** 깊이 31과 32의 정상 배열, 위반 값이 앞선 깊은 입력, 잘못된 최상위 인자와 중첩 호출, 단독 surrogate를 검사한다.
+      - **기대 결과:** 깊이 31은 통과하고 32는 `tool_nesting_limit` 생략을 요청한다. 앞선 위반은 감지하며 잘못된 인자와 중첩 호출은 각각 `guiderails.invalid_tool_payload`, `invalid_nested_calls`다. surrogate는 일반 도구에서 검사를 마칠 수 없어 통과하고, 직접 읽기 인자 검증에서는 `guiderails.invalid_tool_payload`를 반환한다.
+    - **단계 2:** 직렬화 크기가 상한보다 1바이트 작거나 같거나 1바이트 큰 일반 도구와 읽기를 호출한다.
+      - **기대 결과:** 모두 통과하고 상한을 넘은 경우에만 `candidate_too_large` 생략을 요청한다.
+    - **자동화 근거:** `test_json_depth_surrogate_and_utf8_byte_boundaries`
+  - **TC-096 · 크기 상한보다 인자와 효과 오류를 우선한다**
+    - **사전조건:** `verified` 정책과 후보 상한 1,024바이트를 설정한다.
+    - **단계 1:** 작은 입력과 2,048자 입력으로 미지원 도구, 터미널, 잘못된 쓰기·읽기와 잘못된 병렬 호출을 실행한다.
+      - **기대 결과:** 각각의 효과·인자 오류를 반환하고 생략 알림은 요청하지 않는다.
+    - **단계 2:** 정상 구조의 2,048자 쓰기를 `write-session`으로 호출한다.
+      - **기대 결과:** 호출은 통과하고 `candidate_too_large` 생략을 해당 세션에 요청한다.
+    - **자동화 근거:** `test_content_budget_does_not_override_argument_or_effect_rejections`
+  - **TC-097 · 전체 치환 결과가 상한을 넘으면 검사를 생략한다**
+    - **사전조건:** 상한은 1,024바이트이고 대상 파일은 `x` 500바이트다.
+    - **단계 1:** 모든 `x`를 `é` 100자로 치환하는 패치를 `edit-session`으로 호출한다.
+      - **기대 결과:** 호출은 통과하고 `candidate_too_large` 생략을 해당 세션에 한 번 요청한다.
+    - **자동화 근거:** `test_replace_all_overflow_requests_notice`
+  - **TC-098 · 멈춘 파일 읽기와 독립 호출을 분리한다**
+    - **사전조건:** 파일 읽기를 이벤트로 멈추고 검사 제한을 각각 3,000ms와 30ms로 설정한다.
+    - **단계 1:** 쓰기 검사 중 독립 위반 호출을 실행하거나 제한 시간이 끝날 때까지 기다린다.
+      - **기대 결과:** 긴 제한에서는 독립 호출이 `guiderails.pattern_detected`로 차단되고 쓰기는 읽기 해제 후 통과한다. 짧은 제한에서는 쓰기가 통과하며 `inspection_deadline` 생략을 요청한다.
+    - **단계 2:** 파일 읽기가 운영체제 오류 또는 잘못된 UTF-8을 반환하게 한다.
+      - **기대 결과:** 호출이 통과하고 검사 한도 생략 알림은 요청하지 않는다.
+    - **자동화 근거:** `test_stalled_file_read_times_out_without_blocking_independent_calls`
+  - **TC-099 · 크기와 정규식 제한의 알림 전달이 훅을 붙잡지 않는다**
+    - **사전조건:** 공개 메시지 전달을 대기시키고 규칙을 설정한다.
+    - **단계 1:** 크기 초과 입력과 정상 입력을 호출한다.
+      - **기대 결과:** 두 호출이 통과하고 전달이 끝나기 전에 훅이 반환된다. 디버그 로그에 `candidate_too_large`가 있고 로그와 알림에 입력 원문이 없다.
+    - **단계 2:** 정규식 시간 초과와 전달 실패를 주입한 뒤 위반 입력을 검사한다.
+      - **기대 결과:** 시간 초과 호출은 통과하고 후속 위반은 차단된다.
+    - **자동화 근거:** `test_large_and_slow_calls_pass_with_debug_log_and_off_thread_notice`
+
+- [정책 관리자](../tests/integration/test_manager.py)
+  - **TC-100 · 감지 조회와 필터가 활성 스냅샷을 바꾸지 않는다**
+    - **사전조건:** 규칙으로 감지 세 건을 세션 `s1`, `s2`, `s1`에 기록한다.
+    - **단계 1:** 목록, 상태, 양성·음성 샘플, 세션 통계와 순서 기반 보고서를 조회한다.
+      - **기대 결과:** 규칙 ID와 digest가 일치하고 샘플은 `[true, false]`, `s1` 감지는 2건이다. 페이지의 작업 순서는 `first`, `second`다.
+    - **단계 2:** 잘못된 샘플과 필터를 전달한다.
+      - **기대 결과:** 각각 `invalid_management_arguments`, `invalid_management_filters`이며 digest와 검사 결과는 유지된다.
+    - **자동화 근거:** `test_queries_filter_real_detections_without_changing_snapshot`
+  - **TC-101 · 검토한 초안은 사용자 권한과 digest가 맞을 때만 승인한다**
+    - **사전조건:** 모델 제공자가 규칙 제안을 반환한다.
+    - **단계 1:** 제안을 생성하고 저장한다.
+      - **기대 결과:** 생성만으로 파일이 생기지 않고 저장된 초안은 비활성이며 digest는 본문의 SHA-256이다. 활성 규칙은 없다.
+    - **단계 2:** 모델 권한과 틀린 digest로 승인을 시도한 뒤 소유자 권한과 올바른 digest로 승인한다.
+      - **기대 결과:** 앞의 두 요청은 거절되고 관리 파일이 없다. 올바른 승인 후 규칙이 감지하고 준비·완료 이벤트의 작업 ID가 같다.
+    - **자동화 근거:** `test_draft_requires_trusted_approval_and_reviewed_digest`
+  - **TC-102 · 최소 outbox 용량에서 승인한 규칙이 재시작 후 유지된다**
+    - **사전조건:** `max_outbox`를 2로 설정한다.
+    - **단계 1:** 초안을 승인하고 관리자를 재시작한다.
+      - **기대 결과:** 같은 digest의 규칙이 감지하며 준비·완료 이벤트 두 건이 조회된다.
+    - **자동화 근거:** `test_approval_and_restart_at_minimum_outbox_capacity`
+  - **TC-103 · 참처럼 평가되는 권한 값만으로 초안을 저장하지 않는다**
+    - **사전조건:** 권한 확인자가 불리언이 아닌 정수 `1`을 반환한다.
+    - **단계 1:** 모델 권한으로 초안을 저장한다.
+      - **기대 결과:** `PermissionError`가 발생하고 초안 디렉터리는 비어 있다.
+    - **자동화 근거:** `test_truthy_authorization_does_not_allow_draft_storage`
+  - **TC-104 · 잘못된 초기 규칙은 수정 전까지 승인을 막는다**
+    - **사전조건:** 규칙 파일에 잘못된 UTF-8 바이트 `ff`를 저장한다.
+    - **단계 1:** 상태를 조회하고 초안을 저장한 뒤 승인한다.
+      - **기대 결과:** 상태와 승인 오류는 `invalid_pattern_source`이고 원본 바이트와 비어 있는 활성 digest가 유지된다.
+    - **단계 2:** 잘못된 원본을 제거하고 같은 초안을 승인한다.
+      - **기대 결과:** 새 규칙이 위반 문구를 감지한다.
+    - **자동화 근거:** `test_invalid_initial_rules_allow_draft_but_reject_activation_until_fixed`
+  - **TC-105 · 잘못된 입력과 revision 충돌에서 활성 규칙을 보존한다**
+    - **사전조건:** 관리 규칙을 적용하고 원본 바이트와 digest를 보관한다.
+    - **단계 1:** 손상된 초안, 증가하지 않은 revision, 틀린 예상 revision, 수동 파일 충돌을 각각 처리한다.
+      - **기대 결과:** 각각 `invalid_draft_data`, `nonincreasing_revision`, `rule_revision_conflict`, `manual_source_conflict`이며 관리 파일과 digest가 유지된다.
+    - **단계 2:** 관리 파일을 잘못된 UTF-8로 바꾸고 적용한다.
+      - **기대 결과:** `invalid_managed_patterns`를 반환하고 손상된 바이트와 활성 digest를 유지한다.
+    - **자동화 근거:** `test_malformed_inputs_and_revision_conflicts_preserve_active_rules`
+  - **TC-106 · 실패한 reload는 스냅샷을 유지하고 설정은 시작 시 읽는다**
+    - **사전조건:** 기본 `strict` 설정으로 규칙을 열고 설정 파일을 `observe`로 바꾼다.
+    - **단계 1:** 같은 revision의 변경 규칙을 reload한다.
+      - **기대 결과:** `nonincreasing_revision`이며 기존 digest와 감지가 유지된다.
+    - **단계 2:** revision 2로 올려 reload하고 관리자를 다시 연다.
+      - **기대 결과:** 새 문구만 감지한다. 기존 관리자의 모드는 `strict`, 다시 연 관리자의 모드는 `observe`다.
+    - **자동화 근거:** `test_reload_keeps_snapshot_on_failure_and_uses_startup_config`
+  - **TC-107 · 중복 다중 선택자 reload는 기존 대상을 유지한다**
+    - **사전조건:** `docs.update`의 `/changes/*/content` 선택자를 가진 규칙을 연다.
+    - **단계 1:** revision을 올리고 같은 선택자를 두 번 넣어 reload한다.
+      - **기대 결과:** `invalid_pattern_schema`이며 이전 스냅샷 객체와 digest가 유지되고 `/changes/1/content`의 위반을 감지한다.
+    - **자동화 근거:** `test_invalid_multi_selector_reload_preserves_digest_and_active_targets`
+  - **TC-108 · 재시작은 이전 revision과 같은 revision의 변경을 거절한다**
+    - **사전조건:** revision 2 규칙을 열어 이력을 저장한다.
+    - **단계 1:** 같은 revision의 다른 내용과 revision 1을 각각 저장하고 재시작한다.
+      - **기대 결과:** 상태와 reload는 `nonincreasing_revision`이고 유효한 규칙 엔진이 없다.
+    - **단계 2:** 원래 revision 2를 복원한 뒤 revision 3을 reload하고 재시작한다.
+      - **기대 결과:** 원래 digest를 복원하고 새 digest와 새 문구 감지가 재시작 후 유지된다.
+    - **자동화 근거:** `test_restart_rejects_changed_or_older_revision_and_allows_recovery`
+  - **TC-109 · 삭제한 규칙의 revision 이력을 재도입에도 적용한다**
+    - **사전조건:** 두 규칙을 열고 그중 하나를 삭제해 reload한다.
+    - **단계 1:** 삭제한 ID를 같은 revision의 변경된 내용으로 다시 넣고 재시작한다.
+      - **기대 결과:** `nonincreasing_revision`이다.
+    - **단계 2:** 해당 revision을 2로 올려 reload하고 재시작한다.
+      - **기대 결과:** digest가 달라지고 두 규칙 ID가 목록에 표시된다.
+    - **자동화 근거:** `test_removal_and_reintroduction_preserve_revision_history`
+  - **TC-110 · 승인과 reload는 영속 revision 이력을 공유한다**
+    - **사전조건:** revision 2 규칙을 연 뒤 원본을 제거한다.
+    - **단계 1:** 변경된 revision 2 초안을 승인하고 revision 3 초안을 승인한다.
+      - **기대 결과:** revision 2는 `nonincreasing_revision`으로 거절되고 기존 digest가 유지된다. revision 3은 승인된다.
+    - **단계 2:** 재시작 후 관리 파일을 같은 revision의 다른 내용으로 바꾸고 reload한다.
+      - **기대 결과:** reload가 거절되고 승인된 digest가 유지된다. 다시 시작하면 상태에 `nonincreasing_revision`이 표시된다.
+    - **자동화 근거:** `test_approval_and_reload_share_persisted_history`
+  - **TC-111 · revision 이력은 프로필별로 분리된다**
+    - **사전조건:** 프로필 `one`에서 revision 2를 읽는다.
+    - **단계 1:** 파일을 다른 내용의 revision 1로 바꾸고 프로필 `two`, 이어서 `one`을 연다.
+      - **기대 결과:** `two`는 새 문구를 감지하고 `one`은 `nonincreasing_revision`이다.
+    - **단계 2:** 원래 revision 2를 복원해 `one`에서 reload한다.
+      - **기대 결과:** 기존 digest가 복원된다.
+    - **자동화 근거:** `test_revision_history_is_scoped_to_profile`
+  - **TC-112 · 실패한 reload와 적용은 revision 이력을 전진시키지 않는다**
+    - **사전조건:** revision 1 규칙을 열고 digest를 기록한다.
+    - **단계 1:** revision 2 reload의 감사 이벤트 저장을 실패시킨 뒤 revision 1을 복원한다.
+      - **기대 결과:** 저장 오류가 전달되고 digest가 유지되며 revision 1 reload가 성공한다.
+    - **단계 2:** revision 2 적용의 완료 이벤트 저장을 실패시키고 재시작한다.
+      - **기대 결과:** 관리 파일이 생기지 않고 기존 digest가 재시작 후에도 유지된다.
+    - **자동화 근거:** `test_failed_reload_and_approval_do_not_advance_revision_history`
+  - **TC-113 · 규칙 활성화는 revision과 감지 효과를 바꾼다**
+    - **사전조건:** 비활성 revision 1 규칙을 적용한다.
+    - **단계 1:** 예상 revision 1로 규칙을 활성화한다.
+      - **기대 결과:** revision은 2가 되고 위반 문구를 감지한다.
+    - **단계 2:** 이전 revision 1을 예상값으로 비활성화를 요청한다.
+      - **기대 결과:** `rule_revision_conflict`를 반환한다.
+    - **자동화 근거:** `test_enabling_changes_managed_revision_and_effect`
+  - **TC-114 · 준비 후 저장 실패는 원본 바이트를 복원한다**
+    - **사전조건:** 주석과 CRLF가 있는 관리 파일을 열고 digest를 보관한다.
+    - **단계 1:** 변경 커밋에 저장 오류를 주입한다.
+      - **기대 결과:** 오류가 전달되고 원본 바이트와 digest가 복원되며 감사에는 준비 이벤트만 남는다.
+    - **단계 2:** 관리자를 재시작한다.
+      - **기대 결과:** 기존 digest와 감지가 유지된다.
+    - **자동화 근거:** `test_storage_failure_after_prepare_restores_exact_original`
+  - **TC-115 · 교체 직후 중단된 변경은 재시작에서 완료한다**
+    - **사전조건:** 초안을 저장하고 자식 프로세스가 파일 교체 후 커밋 전에 종료 코드 73으로 끝나게 한다.
+    - **단계 1:** 자식 종료 후 관리자를 다시 연다.
+      - **기대 결과:** 새 규칙이 감지하고 준비·완료 이벤트의 작업 ID와 완료 digest가 일치한다.
+    - **단계 2:** 감사를 내보내고 다시 시작한 뒤 같은 revision의 다른 내용을 저장한다.
+      - **기대 결과:** 두 이벤트 ID가 각각 한 번 기록되고 변경된 내용은 `nonincreasing_revision`이다.
+    - **자동화 근거:** `test_restart_commits_prepared_change_if_replaced_bytes_are_present`
+  - **TC-116 · 초기화 실패는 열린 저장소 연결을 닫는다**
+    - **사전조건:** 이미 연 SQLite 저장소를 관리자에 제공한다.
+    - **단계 1:** 감사 작성기 생성과 초기 로딩에서 각각 오류를 주입한다.
+      - **기대 결과:** 원래 오류가 전달되고 이후 연결 조회는 `sqlite3.ProgrammingError`를 낸다.
+    - **자동화 근거:** `test_initialization_failure_closes_open_storage`
+
+- [프로필 통합](../tests/integration/test_profile_integration.py)
+  - **TC-117 · 두 런타임이 거절 한도를 공유하고 reload 뒤에도 유지한다**
+    - **사전조건:** 같은 프로필의 두 런타임에 `max_rejections: 1`을 설정한다.
+    - **단계 1:** 같은 호출 ID 두 건과 서로 다른 호출 ID 두 건을 동시에 위반 입력으로 검사한다.
+      - **기대 결과:** 중복 호출은 같은 판정을 받고, 서로 다른 판정 중 하나가 차단된다. 감사에는 `blocked` 1건과 `warned_allowed` 2건이 남는다.
+    - **단계 2:** 기존 규칙을 개정하고 다른 규칙을 추가해 reload한 뒤 다른 턴·규칙·세션과 빈 세션으로 검사한다.
+      - **기대 결과:** 기존 규칙의 같은 세션 위반은 통과하고 다른 규칙과 다른 세션의 위반은 차단된다. 빈 세션의 두 위반도 차단된다. 잘못된 경로 인자의 차단 메시지에는 `guiderails.pattern_detected`가 없다.
+    - **자동화 근거:** `test_rejection_budget_is_atomic_across_runtimes_and_survives_reload`
+  - **TC-118 · JSONL 장애 중에도 저장된 규칙 판정과 거절 한도를 적용한다**
+    - **사전조건:** 거절 한도를 1로 설정하고 감사 파일을 손상시킨다.
+    - **단계 1:** 위반 입력을 검사한다.
+      - **기대 결과:** `guiderails.pattern_detected`와 함께 호출을 차단하고 차단 시도 집계는 1이다.
+    - **단계 2:** 새 호출 ID로 위반을 검사하고, 손상된 파일을 제거한 뒤 다시 검사한다.
+      - **기대 결과:** 거절 한도를 이미 소진했으므로 두 호출 모두 통과한다.
+    - **자동화 근거:** `test_audit_failure_preserves_the_persisted_pattern_decision`
+  - **TC-119 · 검사 중 reload해도 각 호출은 시작 시점의 스냅샷을 사용한다**
+    - **사전조건:** 단일 인자, 여러 인자, 묶음 호출 각각에 기존 문자열 `original`과 새 문자열 `new marker`를 넣는다.
+    - **단계 1:** 첫 검사 도중 일시 정지하고 기존 규칙을 새 규칙으로 교체해 reload한다. 첫 호출을 재개한 뒤 두 번째 호출을 검사한다.
+      - **기대 결과:** 두 호출은 모두 감지 메시지로 차단된다. 첫 호출의 적중은 `test.initial`과 기존 digest, 두 번째는 `test.next`와 새 digest를 사용한다. 필드 경로는 단일 인자에서 각각 `/value`, 여러 인자에서 `/second`와 `/third`, 묶음에서 `/calls/1/arguments/value`와 `/calls/2/arguments/value`다. 감사와 보고서에도 각 호출의 규칙 ID와 digest가 남는다.
+    - **자동화 근거:** `test_reload_keeps_one_snapshot_for_each_hook_call`
+  - **TC-120 · JSONL 내보내기에 실패해도 저장된 승인을 적용한다**
+    - **사전조건:** 규칙 초안을 제안하고 기존 digest를 기록한다.
+    - **단계 1:** 감사 파일을 손상시킨 뒤 승인을 요청한다.
+      - **기대 결과:** `ok: true`, `audit_pending: true`, `corrupt_audit_json`을 반환하고 새 정책을 적용한다.
+    - **단계 2:** 별도 프로필에서 관리 파일 생성 후 감사 flush가 실패하도록 주입해 승인한다.
+      - **기대 결과:** `ok: true`, `audit_pending: true`, `storage_error`를 반환한다. 관리 파일과 새 digest가 적용되고 대기 이벤트는 2건이다. 이후 새 규칙 위반을 차단하면서 outbox를 비우고 `pattern_changed`를 한 건 기록한다.
+    - **자동화 근거:** `test_approval_commits_with_pending_audit_when_export_fails`
+  - **TC-121 · 제안과 승인 및 reload가 해당 프로필의 정책에만 반영된다**
+    - **사전조건:** 같은 초기 규칙을 가진 두 프로필을 준비한다.
+    - **단계 1:** 첫 프로필에서 `forbidden` 규칙을 제안하고 잘못된 digest의 명령 승인과 도구 승인을 시도한다.
+      - **기대 결과:** 초안의 규칙은 비활성이며 두 승인 시도 후에도 기존 digest와 통과 판정이 유지된다.
+    - **단계 2:** 올바른 초안 ID와 digest로 승인하고 두 프로필에서 검사한다.
+      - **기대 결과:** 첫 프로필의 digest가 바뀌고 위반은 차단되며 규칙 샘플 검사는 `[True]`다. 두 번째 프로필의 digest는 그대로이고 위반은 통과한다.
+    - **단계 3:** 첫 프로필에 잘못된 스키마 파일을 추가해 reload한 뒤 제거하고 다시 reload한다.
+      - **기대 결과:** 실패한 reload는 승인된 digest와 차단 동작을 유지한다. 파일 제거 후 reload는 성공하고 digest는 유지되며 두 번째 프로필의 감지 집계는 0이다.
+    - **자동화 근거:** `test_proposal_approval_reload_and_profile_isolation`
+  - **TC-122 · 감지 식별자를 중복 제거하고 감사에서 입력 원문을 제외한다**
+    - **사전조건:** 초기 규칙이 `original`을 감지한다.
+    - **단계 1:** 같은 요청·세션·호출 식별자로 두 번 검사하고 요청 또는 세션 식별자를 바꿔 두 번 더 검사한다. 입력에는 `private payload`를 포함한다.
+      - **기대 결과:** 네 호출 모두 차단된다. 전체 감지는 3건, 첫 세션 감지와 보고서의 감지 이벤트는 각각 2건이다. 감사 이벤트 ID는 고유하고 감사 내용에 `private payload`가 없다.
+    - **자동화 근거:** `test_detection_identity_and_private_audit`
+  - **TC-123 · 런타임 재시작 뒤에도 동일한 감지를 중복 집계하지 않는다**
+    - **사전조건:** 초기 규칙 위반을 한 번 검사해 감지 1건을 기록한다.
+    - **단계 1:** 런타임을 닫고 같은 프로필에서 다시 연 뒤 동일한 호출과 새 요청 ID의 호출을 검사한다.
+      - **기대 결과:** 두 호출 모두 차단된다. 동일 호출 후 집계는 1이고 새 요청 후에는 2다. 보고서 감지는 2건이며 감사 이벤트 ID는 고유하다.
+    - **자동화 근거:** `test_detection_deduplication_survives_runtime_restart`
+  - **TC-124 · 감사 기록 후 완료 표시가 실패해도 복구 시 중복 기록하지 않는다**
+    - **사전조건:** 이벤트의 exported 갱신을 실패시키는 DB 트리거를 설치한다.
+    - **단계 1:** 위반 입력을 검사한다.
+      - **기대 결과:** 호출은 차단되고 내부 오류 문구는 응답에 없다. 대기 이벤트는 1건이며 해당 ID는 감사 파일에 이미 한 번 존재한다.
+    - **단계 2:** 트리거를 제거하고 상태를 조회한다.
+      - **기대 결과:** 상태 조회가 성공하고 outbox가 비며 해당 ID는 감사 파일에 한 번만 남는다.
+    - **자동화 근거:** `test_audit_append_before_ack_recovers_without_duplicate`
+  - **TC-125 · 손상된 감사 파일과 대기 이벤트를 보존하고 부분 꼬리를 복구한다**
+    - **사전조건:** 감사 파일에 필수 내용이 빠진 완전한 줄을 쓴다.
+    - **단계 1:** 위반 입력을 검사한다.
+      - **기대 결과:** 호출은 차단되고 손상된 바이트가 유지되며 이벤트 1건이 대기한다.
+    - **단계 2:** 감사 파일을 미완성 JSON 꼬리로 바꾸고 상태를 조회한다.
+      - **기대 결과:** 상태 조회가 성공하고 outbox가 빈다. 감사에는 대기했던 이벤트 ID 하나가 남고 이전 손상 문구는 없다.
+    - **자동화 근거:** `test_corrupt_audit_preserves_pending_then_repairs_partial_tail`
+  - **TC-126 · 내보내기 완료 표시 복구 후 가득 찬 outbox를 재생한다**
+    - **사전조건:** 거절 한도 1과 `max_outbox: 2`를 설정하고 exported 갱신을 실패시킨다.
+    - **단계 1:** 서로 다른 호출 ID로 위반을 세 번 검사한다.
+      - **기대 결과:** 첫 호출은 규칙으로 차단되고 두 번째 호출은 한도 소진으로 통과한다. 새 세션의 세 번째 호출은 아웃박스가 가득 차 감지를 저장하지 못하므로 통과한다. 대기 ID 2개는 이미 기록된 ID와 같고 규칙 차단 시도 집계는 1이다.
+    - **단계 2:** 장애를 제거하고 런타임을 재시작한 뒤 세 번째 호출과 같은 세션에서 새 호출을 검사한다.
+      - **기대 결과:** 새 호출은 규칙 감지 메시지와 함께 차단되고 outbox는 빈다. 감사의 호출 순서는 `first`, `second`, `recovered`이며 앞의 두 ID는 유지되고 세 ID는 고유하다. 한도 소진 후 위반은 통과한다.
+    - **자동화 근거:** `test_detection_recovers_full_outbox_after_export_ack_is_restored`
+  - **TC-127 · 관리 파일 쓰기와 DB 커밋 실패가 활성 정책을 유지한다**
+    - **사전조건:** 새 규칙 초안과 기존 digest를 준비한다.
+    - **단계 1:** 관리 파일 교체 쓰기 실패를 주입하고 승인한다.
+      - **기대 결과:** 응답은 실패하고 내부 파일 오류 문구가 없다. 관리 파일은 없으며 digest와 `forbidden` 통과 판정이 유지된다.
+    - **단계 2:** 파일 교체 후 지연 외래 키 위반으로 커밋이 실패하도록 주입하고 승인한다.
+      - **기대 결과:** 응답은 실패하고 관리 파일이 없으며 기존 digest와 통과 판정이 유지된다. 트리거 제거 후 같은 승인은 성공한다.
+    - **자동화 근거:** `test_file_and_commit_failures_preserve_active_policy`
+  - **TC-128 · 파일 교체 직후 중단된 승인을 재시작에서 정리한다**
+    - **사전조건:** 초안을 만들고 기존 런타임을 닫는다.
+    - **단계 1:** 격리된 자식 프로세스에서 승인 중 관리 파일 교체 직후 종료한다.
+      - **기대 결과:** 자식 종료 코드는 77이고 관리 파일은 존재한다.
+    - **단계 2:** 같은 프로필의 런타임을 재시작하고 새 규칙을 검사한다.
+      - **기대 결과:** digest가 바뀌고 위반이 차단된다. 새 digest의 `pattern_changed`는 보고서에 1건이며 상태 조회가 성공하고 감사 이벤트 ID는 고유하다.
+    - **자동화 근거:** `test_interrupted_replace_is_reconciled_on_restart`
+  - **TC-129 · 제공자 응답을 기다리는 동안 검사와 unload를 처리한다**
+    - **사전조건:** 제안 제공자의 응답을 이벤트로 대기시키고 기존 digest를 기록한다.
+    - **단계 1:** 제안을 시작한 뒤 제공자가 대기 중일 때 기존 규칙 위반을 검사하고 unload한다.
+      - **기대 결과:** 검사는 차단되고 unload가 반환되며 제안은 아직 완료되지 않는다.
+    - **단계 2:** 제공자 응답을 풀어준다.
+      - **기대 결과:** 제안은 `proposal_invalidated`이고 초안은 없다. 이후 상태는 `runtime_closed`이며 런타임의 관리자는 없다. 훅은 일반 도구 호출을 계속 진행시킨다.
+    - **자동화 근거:** `test_provider_wait_does_not_block_inspection_or_unload`
+  - **TC-130 · 대기 중 프로필 범위가 바뀌었다 복원되어도 제안을 무효화한다**
+    - **사전조건:** 제안 제공자를 대기시키고 기존 digest를 기록한다.
+    - **단계 1:** 프로필 이름을 변경한 상태에서 원래 프로필의 규칙에 해당하는 입력을 전달하고 이름을 복원한 뒤 응답을 풀어준다.
+      - **기대 결과:** 훅은 변경된 범위에서 일반 호출을 진행시키고 제안은 `proposal_invalidated`다. digest는 유지되고 초안은 없다.
+    - **자동화 근거:** `test_scope_change_invalidates_delayed_proposal_even_if_restored`
+  - **TC-131 · 대기 중 홈 경로가 바뀌면 제안을 무효화한다**
+    - **사전조건:** 별도 프로필 홈에서 제안 제공자를 대기시키고 기존 digest를 기록한다.
+    - **단계 1:** 현재 홈을 다른 경로로 바꾼 상태에서 원래 프로필의 규칙에 해당하는 입력을 전달하고 홈을 복원한 뒤 응답을 풀어준다.
+      - **기대 결과:** 훅은 변경된 홈에서 일반 호출을 진행시키고 제안은 `proposal_invalidated`다. 기존 digest는 유지되고 초안과 다른 홈 경로는 생성되지 않는다.
+    - **자동화 근거:** `test_home_change_invalidates_delayed_proposal`
+  - **TC-132 · 제공자 오류의 상세 내용을 숨기고 초안을 만들지 않는다**
+    - **사전조건:** 기존 digest를 기록하고 제공자가 `private provider body` 오류를 발생시키도록 한다.
+    - **단계 1:** 새 규칙을 제안한다.
+      - **기대 결과:** `pattern_provider_failed`를 반환하고 응답에 오류 원문이 없다. digest는 유지되고 초안은 없다.
+    - **자동화 근거:** `test_provider_failure_is_private_and_does_not_create_draft`
+  - **TC-133 · 동시 제안은 서로 다른 비활성 초안으로 남는다**
+    - **사전조건:** 두 제공자 호출이 함께 대기하도록 설정하고 기존 digest를 기록한다.
+    - **단계 1:** 두 제안을 동시에 시작하고 대기 중 digest를 확인한 뒤 응답을 풀어준다.
+      - **기대 결과:** 대기 중과 완료 후 digest가 유지된다. 두 제안은 성공하고 서로 다른 ID의 비활성 초안 두 개가 저장된다. `forbidden` 검사는 통과한다.
+    - **자동화 근거:** `test_concurrent_proposals_remain_inactive`
+
+- [상태·감사](../tests/integration/test_state.py)
+  - **TC-134 · 중복 감지와 조회 범위를 구분합니다**
+    - **사전조건:** 같은 SQLite 파일에 프로필 `one`과 `two`를 열고 감지를 기록합니다.
+    - **단계 1:** 같은 호출을 재기록하고 규칙, 요청, 세션과 프로필을 바꿔 기록한 뒤 집계와 페이지를 조회합니다.
+      - **기대 결과:** 중복은 첫 레코드를 반환하고 `one`의 감지·매치는 4·5건, 세션 `s`의 감지는 3건, `rule.two`와 `two`의 감지는 각각 1건입니다. 페이지는 2건과 1건으로 순서가 이어지며 잘못된 커서는 거부됩니다.
+    - **자동화 근거:** `test_deduplication_filters_pages_and_profile_isolation`
+  - **TC-135 · 가린 발췌를 조회하고 실패한 트랜잭션을 되돌립니다**
+    - **사전조건:** 발췌 저장과 `observe` 모드를 켜고 `secret`을 가리는 변환기를 설정합니다.
+    - **단계 1:** `secret value`를 감지·내보낸 뒤 이벤트 트랜잭션에서 예외를 발생시킵니다.
+      - **기대 결과:** 조회에는 `[redacted] value`와 `observe`가 표시되고 JSONL에는 `secret`과 `excerpt`가 없습니다. 롤백 후 조회 레코드는 1건입니다.
+    - **자동화 근거:** `test_excerpt_ttl_metadata_and_transaction_rollback`
+  - **TC-136 · 발췌는 설정된 만료 시각에 삭제됩니다**
+    - **사전조건:** 발췌 보관 기간을 기본값 1일과 지정값 7일로 각각 설정합니다.
+    - **단계 1:** 발췌를 기록하고 만료 직전과 만료 시각에 조회합니다.
+      - **기대 결과:** 저장된 만료 시각은 기록 시각에 해당 일수를 더한 값입니다. 직전에는 발췌와 저장 행이 있고 만료 시각에는 둘 다 없습니다.
+    - **자동화 근거:** `test_excerpt_retention_default_and_configured_boundaries`
+  - **TC-137 · 완료 표시 실패 후 부분 꼬리를 복구합니다**
+    - **사전조건:** 이벤트 1건을 기록하고 완료 표시를 실패시키는 SQLite 트리거를 설치합니다.
+    - **단계 1:** 내보내기에 실패한 뒤 트리거를 제거하고 JSONL에 부분 꼬리를 추가해 다시 내보냅니다.
+      - **기대 결과:** 실패 직후 outbox에 1건이 남고 복구 후 outbox는 비며 JSONL에는 해당 이벤트 ID가 한 번만 있습니다.
+    - **자동화 근거:** `test_append_before_ack_and_partial_recovery`
+  - **TC-138 · 복구 기록의 동기화가 끝나야 완료 표시합니다**
+    - **사전조건:** 최초 파일 동기화 실패로 이벤트를 남기고 활성 파일 또는 회전본에서 복구합니다.
+    - **단계 1:** 파일, 해당 디렉터리, 상위 디렉터리의 동기화 실패를 각각 두 번 주입한 뒤 다시 내보냅니다.
+      - **기대 결과:** 실패마다 `audit_export_failed`, pending 1건과 원본 바이트가 유지됩니다. 복구 후 outbox가 비고 이벤트 ID는 한 번만 남으며 회전본 복구는 활성 파일을 새로 만들지 않습니다.
+    - **자동화 근거:** `test_recovered_records_require_file_and_directory_sync_before_ack`
+  - **TC-139 · 재생은 pending과 완전히 같은 기록만 완료합니다**
+    - **사전조건:** 활성 파일과 회전본 각각에 pending 이벤트와 ID는 같지만 내용이 다른 JSONL을 준비합니다.
+    - **단계 1:** 필드 부족, 값 변경, 추가 필드, 내보낸 시각 누락, 타입 불일치를 각각 처리하고 올바른 기록으로 바꿔 재시도합니다.
+      - **기대 결과:** 불일치마다 `audit_event_mismatch`를 반환하고 파일과 pending 1건을 유지합니다. 일치하는 기록은 추가 쓰기 없이 완료되며 다음 내보내기는 0건입니다.
+    - **자동화 근거:** `test_replay_requires_complete_matching_pending_content`
+  - **TC-140 · pending 본문의 이벤트 ID가 다르면 재생을 거부합니다**
+    - **사전조건:** JSONL에 올바른 이벤트를 기록한 뒤 pending 본문의 ID만 바꿉니다.
+    - **단계 1:** 내보내기를 다시 수행합니다.
+      - **기대 결과:** `corrupt_audit_json`을 반환하고 JSONL 바이트와 pending 1건을 유지합니다.
+    - **자동화 근거:** `test_replay_rejects_mismatched_pending_payload_id`
+  - **TC-141 · 긴 감사 레코드를 제한된 크기로 읽습니다**
+    - **사전조건:** 20만 문자의 참조를 포함한 이벤트를 내보내고 다시 pending으로 표시합니다.
+    - **단계 1:** 각 읽기 크기를 검사하며 재생합니다.
+      - **기대 결과:** 읽기는 두 번보다 많이 일어나고 매번 1~65536바이트로 제한됩니다. 내보내기는 1건을 처리하고 파일 바이트는 바뀌지 않습니다.
+    - **자동화 근거:** `test_replay_reads_long_lines_in_bounded_chunks`
+  - **TC-142 · 잘못된 회전본 이름과 큰 pending 앞에서 부분 꼬리를 보존합니다**
+    - **사전조건:** 활성 파일에 부분 꼬리와 pending 이벤트를 두고 잘못된 회전본 이름을 만듭니다.
+    - **단계 1:** 내보내기 후 잘못된 파일을 지우고 레코드 크기 제한을 1024바이트로 낮춰 다시 내보냅니다.
+      - **기대 결과:** 각각 `corrupt_archive_name`, `audit_record_too_large`를 반환하며 부분 꼬리와 pending 1건을 유지합니다. 제한 해제 후 1건을 내보냅니다.
+    - **자동화 근거:** `test_invalid_archive_and_oversized_pending_preserve_partial`
+  - **TC-143 · 손상된 활성 파일과 FIFO를 보존합니다**
+    - **사전조건:** pending 이벤트를 두고 활성 경로에 잘못된 JSON, 크기 초과 데이터, 지원되는 환경에서는 FIFO를 차례로 둡니다.
+    - **단계 1:** 각 상태에서 내보내기를 시도한 뒤 해당 경로를 제거합니다.
+      - **기대 결과:** JSON과 크기 초과는 각각 `corrupt_audit_json`, `audit_record_too_large`이며 파일과 pending을 유지합니다. FIFO도 오류 후 유지되고 제거 후 1건을 내보냅니다.
+    - **자동화 근거:** `test_corrupt_complete_oversized_and_nonregular_files_preserved`
+  - **TC-144 · 손상된 회전본이 활성 파일을 바꾸지 않습니다**
+    - **사전조건:** 활성 파일에 부분 꼬리와 pending 1건을 둡니다.
+    - **단계 1:** 회전본에 잘못된 JSON, 크기 초과 데이터, 부분 레코드를 각각 넣고 내보냅니다.
+      - **기대 결과:** 각각 `corrupt_audit_json`, `audit_record_too_large`, `corrupt_archive`를 반환하고 회전본·활성 꼬리·pending을 유지합니다. 회전본 제거 후 1건을 내보냅니다.
+    - **자동화 근거:** `test_archive_corruption_and_oversize_do_not_change_active_file`
+  - **TC-145 · 잘못된 키와 감사 경로 교체를 거부합니다**
+    - **사전조건:** 33바이트 HMAC 키를 준비한 다음 키를 제거하고 pending 이벤트와 외부 파일을 준비합니다.
+    - **단계 1:** 감지 기록을 시도하고, 감사 파일을 여는 순간 외부 파일을 가리키는 심볼릭 링크로 교체해 내보냅니다.
+      - **기대 결과:** 잘못된 키는 `invalid_hmac_key`이며 outbox는 비어 있습니다. 경로 교체는 오류가 나고 외부 바이트와 pending 1건이 유지되며 링크 제거 후 1건을 내보냅니다.
+    - **자동화 근거:** `test_invalid_key_and_swap_reject_without_losing_pending`
+  - **TC-146 · 회전된 파일과 활성 파일의 중복 ID를 감지합니다**
+    - **사전조건:** 회전 임계값을 1바이트로 설정하고 이벤트 2건을 내보냅니다.
+    - **단계 1:** 회전본 내용을 활성 파일 앞에 복사하고 다시 내보냅니다.
+      - **기대 결과:** 회전본은 1개이며 재시도는 `duplicate_audit_event`를 반환하고 outbox 건수와 활성 파일 바이트를 유지합니다.
+    - **자동화 근거:** `test_rotation_and_duplicate_id_detection`
+  - **TC-147 · 상태 저장소 초기화 실패 시 연결을 닫습니다**
+    - **사전조건:** 데이터베이스가 아닌 파일을 SQLite 연결 대상으로 사용합니다.
+    - **단계 1:** 해당 연결로 상태 저장소를 초기화합니다.
+      - **기대 결과:** `StorageError`가 발생하고 이후 연결에서 쿼리하면 `sqlite3.ProgrammingError`가 발생합니다.
+    - **자동화 근거:** `test_failed_open_closes_connection`
+  - **TC-148 · 보관 정리 실패 후 이벤트를 한 번만 재생합니다**
+    - **사전조건:** 이벤트 1건을 기록하고 보관 정리에 오류를 주입합니다.
+    - **단계 1:** 내보내기에 실패한 뒤 오류 주입을 해제하고 다시 내보냅니다.
+      - **기대 결과:** 실패 후 pending은 1건이고 재시도 후 outbox는 비며 JSONL에 해당 ID가 한 번 있습니다.
+    - **자동화 근거:** `test_retention_failure_keeps_pending_and_replays_once`
+  - **TC-149 · 회전된 미완료 이벤트를 보관 정리에서 유지합니다**
+    - **사전조건:** 이벤트 2건과 작은 회전·보관 크기 제한을 설정하고 완료 표시 실패를 주입합니다.
+    - **단계 1:** 내보내기에 실패한 뒤 완료 표시 장애를 해제하고 재생합니다.
+      - **기대 결과:** 실패 후 pending은 2건이고 회전본이 존재합니다. 재생은 2건을 처리하고 전체 파일에는 두 ID가 각각 한 번 남습니다.
+    - **자동화 근거:** `test_retention_does_not_delete_rotated_unacknowledged_events`
+  - **TC-150 · 여러 프로세스가 이벤트를 한 번씩 내보냅니다**
+    - **사전조건:** 이벤트 20건을 준비합니다.
+    - **단계 1:** 여러 프로세스에서 동시에 감사 내보내기를 실행합니다.
+      - **기대 결과:** 프로세스 종료 코드는 모두 0이고 JSONL의 이벤트 ID 20개는 고유하며 outbox는 비어 있습니다.
+    - **자동화 근거:** `test_multiple_processes_export_each_id_once`
+
+- [알림 전달](../tests/integration/test_notice_delivery.py)
+  - **TC-151 · 차단과 경고 판정마다 간결한 알림을 한 번 보냅니다**
+    - **사전조건:** 거절 한도를 1로 설정하고 경로와 원문을 포함한 쓰기 호출을 준비합니다.
+    - **단계 1:** 첫 호출과 두 번째 호출을 각각 반복하고 다음 모델 요청을 확인합니다.
+      - **기대 결과:** 첫 호출은 차단되고 두 번째는 경고 후 허용됩니다. 각 감사 ID 앞 8자를 붙인 `BLOCKED`와 `WARNED` 메시지가 한 건씩 있으며 경로와 원문은 없고 모델 요청에는 교정 지침이 있습니다.
+    - **자동화 근거:** `test_block_warn_and_replay_have_one_concise_notice_per_audit_decision`
+  - **TC-152 · 새 시도의 같은 호출 ID는 새 판정과 알림을 만듭니다**
+    - **사전조건:** 같은 세션과 호출 ID를 사용합니다.
+    - **단계 1:** 서로 다른 두 시도에서 호출하고 각 시도 안에서 다시 호출합니다.
+      - **기대 결과:** 각 반복은 기존 차단 판정을 반환하고 차단 감사 이벤트와 해당 ID가 포함된 알림은 각각 2건입니다.
+    - **자동화 근거:** `test_same_call_id_in_new_attempt_is_a_new_audit_decision`
+  - **TC-153 · 전송 시간 초과 후 차단 알림을 재전송하거나 갱신하지 않습니다**
+    - **사전조건:** 공개 메시지 전송이 timeout을 반환하도록 설정하고 뷰어와 편집 호출을 기록합니다.
+    - **단계 1:** 차단 호출을 반복하고 모델 요청과 검사 시간 초과 알림을 실행합니다.
+      - **기대 결과:** 전송 시도는 차단과 `BYPASSED` 각 1건이며 뷰어 전달과 편집은 없습니다. `post_api_request` 훅도 등록되지 않습니다.
+    - **자동화 근거:** `test_timeout_never_resends_edits_or_falls_back_to_viewer`
+  - **TC-154 · 알림 전송 실패가 판정과 모델 교정을 바꾸지 않습니다**
+    - **사전조건:** 거절 한도를 1로 설정하고 메시지 전송에서 예외를 발생시킵니다.
+    - **단계 1:** 위반 호출 두 건과 정상 호출 한 건을 실행하고 다음 모델 요청을 확인합니다.
+      - **기대 결과:** 첫 위반은 차단되고 두 번째 위반과 정상 호출은 허용됩니다. 전송 시도는 2건, 뷰어 전달은 0건이며 모델 요청에는 교정 지침이 있습니다.
+    - **자동화 근거:** `test_send_failure_preserves_block_warn_and_model_correction`
+  - **TC-155 · 동시 알림은 원래 프로필과 세션 경로를 유지합니다**
+    - **사전조건:** 프로필 `a`, `b`와 세션별 출처 컨텍스트를 준비합니다.
+    - **단계 1:** `a/shared`, `a/other`, `b/shared`에서 동시에 위반 호출을 실행합니다.
+      - **기대 결과:** 세 호출은 차단되고 `BLOCKED · fixture_tool` 알림 3건이 각각 원래 프로필과 경로로 전달됩니다.
+    - **자동화 근거:** `test_parallel_profiles_and_sessions_keep_origin_context`

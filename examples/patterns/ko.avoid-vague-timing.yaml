@@ -1,0 +1,21 @@
+schema_version: 1
+rules:
+  - id: ko.avoid-vague-timing
+    revision: 2
+    enabled: true
+    description: 문서에서 '가능한 한 빨리'는 기한을 모호하게 표현합니다.
+    priority: 100
+    scopes: [artifact.text]
+    matcher:
+      type: match
+      value: '가능한 한 빨리'
+      case_sensitive: true
+      normalization: nfc
+    edit_policy: whole_result
+    announce:
+      instruction: 확인된 기한을 '금요일 17시까지 처리한다'처럼 쓰세요. 기한을 모르면 기한이 미정임을 명시하세요.
+    tests:
+      positive:
+        - '가능한 한 빨리 처리한다.'
+      negative:
+        - '금요일 17시까지 처리한다.'

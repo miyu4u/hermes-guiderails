@@ -1,0 +1,35 @@
+schema_version: 1
+rules:
+  - id: ko.avoid-meaning-disclaimer
+    revision: 5
+    enabled: true
+    description: "'검토는 끝났다. 공식 승인을 뜻하지 않는다'처럼 앞 진술의 의미를 뒤에서 부정하는 표현을 쓰지 않습니다."
+    priority: 70
+    scopes: [tool.arguments]
+    arguments:
+      - {tool: mcp__notion__notion_create_pages, path: '/pages/*/content'}
+      - {tool: mcp__notion__notion_update_page, path: /content}
+      - {tool: mcp__notion__notion_update_page, path: /new_str}
+      - {tool: mcp__notion__notion_update_page, path: '/content_updates/*/new_str'}
+    matcher:
+      type: regex
+      pattern: "(?:(?:이?지만|습니다만)[ \t]*,?[ \t]*|(?:다|요)[.][ \t\r\n]+)[^.!?…\r\n]{1,160}?(?:을|를)[ \t]+(?:의미|뜻)(?:하는[ \t]*(?:(?:것|게)[ \t]*은?|건)[ \t]*(?:아니다|아닙니다|아니에요)|하지(?:는)?[ \t]+(?:않는다|않습니다|않아요))[ \t]*(?:[.!?…]|$)"
+      flags: [MULTILINE]
+      normalization: nfc
+    edit_policy: whole_result
+    announce:
+      instruction: "앞 진술의 의미를 뒤에서 부정하거나, 한정, 또는 면책하는 표현을 쓰지 않습니다. 대신, 진술의 의미를 그대로 표현하세요."
+    tests:
+      positive:
+        - 'A 이지만 B를 의미하는 것은 아니다.'
+        - 'A이다. B를 뜻하지 않는다.'
+        - '검토는 끝났지만, 공식 승인을 뜻하는 건 아닙니다.'
+        - '로컬에서 확인했다. 운영 환경의 정상 동작을 의미하지는 않는다.'
+        - |-
+          파일은 생성됐다.
+          배포 완료를 뜻하지 않습니다.
+      negative:
+        - '검토는 끝났다. 공식 승인은 금요일에 진행한다.'
+        - '검토는 끝났지만 공식 승인은 남아 있다.'
+        - '이 기호는 승인 완료를 의미한다.'
+        - '이 기호는 승인 완료를 의미하지 않는다.'
